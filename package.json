@@ -40,6 +40,7 @@
     "puppeteer-core": "^24.34.0",
     "puppeteer-extra": "^3.3.6",
     "puppeteer-extra-plugin-stealth": "^2.11.2",
+    "tar": "^7.5.22",
     "ytdl-core": "^4.11.5"
   },
   "devDependencies": {

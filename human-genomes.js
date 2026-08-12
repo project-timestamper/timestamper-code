@@ -110,6 +110,8 @@ const isGzipUrl = (url) => pathnameOf(url).endsWith('.gz')
 
 const isVcfUrl = (url) => /\.vcf(\.gz)?$/i.test(pathnameOf(url))
 
+const isIndexUrl = (url) => /\.(?:tbi|csi)$/i.test(pathnameOf(url))
+
 const createHeaderScanner = () => {
   let buf = ''
   let finished = false
@@ -255,6 +257,35 @@ const extractSourceFetchUrls = (value) => {
   return urls
 }
 
+// Concatenated gzip / BGZF: keep reading members until the input ends.
+// Attach error handling immediately so zlib errors don't become unhandled rejections.
+const inflateGzip = async (body, onChunk, { until = () => false } = {}) => {
+  const unzip = createGunzip()
+  const done = new Promise((resolve, reject) => {
+    unzip.once('end', resolve)
+    unzip.once('error', reject)
+  })
+  done.catch(() => {})
+
+  unzip.on('data', onChunk)
+
+  try {
+    for await (const chunk of body) {
+      if (!unzip.write(chunk)) {
+        await Promise.race([once(unzip, 'drain'), done])
+      }
+      if (until()) {
+        unzip.removeAllListeners('error')
+        return
+      }
+    }
+    unzip.end()
+    await done
+  } finally {
+    unzip.destroy()
+  }
+}
+
 const hashStream = async (body, { gunzip = false, scanHeader = false } = {}) => {
   const hash = createHash('sha256')
   const scanner = scanHeader ? createHeaderScanner() : null
@@ -270,47 +301,14 @@ const hashStream = async (body, { gunzip = false, scanHeader = false } = {}) => 
     for await (const chunk of body) {
       update(chunk)
     }
-    return {
-      digest: hash.digest('hex'),
-      reference: scanner?.reference ?? null,
-      sources: scanner?.sources ?? []
-    }
+  } else {
+    await inflateGzip(body, update)
   }
 
-  const unzip = createGunzip()
-  let resolveDigest
-  let rejectDigest
-  const digestPromise = new Promise((resolve, reject) => {
-    resolveDigest = resolve
-    rejectDigest = reject
-  })
-
-  unzip.on('data', (chunk) => {
-    update(chunk)
-  })
-  unzip.once('error', rejectDigest)
-  unzip.once('end', () => {
-    resolveDigest(hash.digest('hex'))
-  })
-
-  try {
-    for await (const chunk of body) {
-      if (!unzip.write(chunk)) {
-        await once(unzip, 'drain')
-      }
-      // Keep reading the full VCF for hashing; header fields are only scanned near the top.
-    }
-    unzip.end()
-    const digest = await digestPromise
-    return {
-      digest,
-      reference: scanner?.reference ?? null,
-      sources: scanner?.sources ?? []
-    }
-  } catch (e) {
-    unzip.destroy()
-    digestPromise.catch(() => {})
-    throw e
+  return {
+    digest: hash.digest('hex'),
+    reference: scanner?.reference ?? null,
+    sources: scanner?.sources ?? []
   }
 }
 
@@ -339,14 +337,12 @@ const peekVcfHeaderOnce = async (url) => {
   }
 
   const scanner = createHeaderScanner()
-  const gunzip = isGzipUrl(url) ? createGunzip() : null
-
   const feed = (chunk) => {
     scanner.push(chunk)
   }
 
   try {
-    if (!gunzip) {
+    if (!isGzipUrl(url)) {
       for await (const chunk of response.body) {
         feed(chunk)
         if (scanner.finished) {
@@ -354,21 +350,7 @@ const peekVcfHeaderOnce = async (url) => {
         }
       }
     } else {
-      gunzip.on('data', feed)
-      const errorPromise = new Promise((resolve, reject) => {
-        gunzip.once('error', reject)
-        gunzip.once('end', resolve)
-      })
-      for await (const chunk of response.body) {
-        if (!gunzip.write(chunk)) {
-          await once(gunzip, 'drain')
-        }
-        if (scanner.finished) {
-          break
-        }
-      }
-      gunzip.end()
-      await errorPromise.catch(() => {})
+      await inflateGzip(response.body, feed, { until: () => scanner.finished })
     }
   } finally {
     if (typeof response.body.cancel === 'function') {
@@ -377,9 +359,6 @@ const peekVcfHeaderOnce = async (url) => {
       } catch {
         // ignore cancel errors after partial read
       }
-    }
-    if (gunzip) {
-      gunzip.destroy()
     }
   }
 
@@ -557,7 +536,7 @@ export const collectHumanGenomeHashes = async (outputPath = DEFAULT_OUTPUT) => {
   console.log('cached extra urls:', extraUrls.size)
   console.log('headers scanned:', scannedKeys.size)
 
-  const files = await spiderFiles(ROOT_URLS)
+  const files = (await spiderFiles(ROOT_URLS)).filter((url) => !isIndexUrl(url))
   const todoFiles = files.filter(url => !done.has(relativeKey(url)))
   console.log('listed:', files.length, 'todo:', todoFiles.length)
 
@@ -610,7 +589,7 @@ export const collectHumanGenomeHashes = async (outputPath = DEFAULT_OUTPUT) => {
     }
   }
 
-  const extraList = [...extraUrls].sort()
+  const extraList = [...extraUrls].filter((url) => !isIndexUrl(url)).sort()
   console.log('extra files to hash:', extraList.length)
   for (const url of extraList) {
     const key = relativeKey(url)
