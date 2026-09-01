@@ -252,6 +252,7 @@ export const collectHumanGenomeHashes = async (outputPath = DEFAULT_OUTPUT) => {
   for (const url of todoFiles) {
     const key = relativeKey(url)
     attempted++
+    console.log(`fetching ${attempted}/${todoFiles.length}`, key)
     try {
       const digest = await hashFile(url)
       appendHash(outputPath, key, digest)
