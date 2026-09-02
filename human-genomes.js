@@ -1,10 +1,5 @@
 import { createHash } from 'node:crypto'
-import { once } from 'node:events'
 import fs from 'node:fs'
-import path from 'node:path'
-import { Readable } from 'node:stream'
-import { pipeline } from 'node:stream/promises'
-import { createGunzip } from 'node:zlib'
 import minimist from 'minimist'
 import esMain from 'es-main'
 
@@ -22,13 +17,6 @@ const HASH_RETRIES = 5
 const RETRY_DELAY_MS = 10000
 
 const sleep = (ms) => new Promise(resolve => setTimeout(resolve, ms))
-
-const sidecarPath = (outputPath, suffix) => {
-  if (outputPath.endsWith('_hashes.txt')) {
-    return outputPath.replace(/_hashes\.txt$/, `_${suffix}`)
-  }
-  return `${outputPath}.${suffix}`
-}
 
 const normalizeDirUrl = (url) => (url.endsWith('/') ? url : `${url}/`)
 
@@ -109,61 +97,17 @@ const pathnameOf = (url) => {
   }
 }
 
-const isGzipUrl = (url) => pathnameOf(url).endsWith('.gz')
-
 const isIndexUrl = (url) => /\.(?:tbi|csi)$/i.test(pathnameOf(url))
 
-// Concatenated gzip / BGZF: keep reading members until the input ends.
-const inflateGzip = async (body, onChunk) => {
-  const unzip = createGunzip()
-  const done = new Promise((resolve, reject) => {
-    unzip.once('end', resolve)
-    unzip.once('error', reject)
-  })
-  done.catch(() => {})
-
-  unzip.on('data', onChunk)
-
-  try {
-    for await (const chunk of body) {
-      if (!unzip.write(chunk)) {
-        await Promise.race([once(unzip, 'drain'), done])
-      }
-    }
-    unzip.end()
-    await done
-  } finally {
-    unzip.destroy()
-  }
-}
-
-const hashStream = async (body, { gunzip = false } = {}) => {
+const hashStream = async (body) => {
   const hash = createHash('sha256')
-
-  if (!gunzip) {
-    for await (const chunk of body) {
-      hash.update(chunk)
-    }
-  } else {
-    await inflateGzip(body, (chunk) => hash.update(chunk))
+  for await (const chunk of body) {
+    hash.update(chunk)
   }
-
   return hash.digest('hex')
 }
 
-const cacheFilePath = (cacheDir, key) =>
-  path.join(cacheDir, key.replaceAll('/', '__'))
-
-const fetchExpectedSize = async (url) => {
-  const response = await fetch(url, { method: 'HEAD', headers: { 'User-Agent': USER_AGENT } })
-  if (!response.ok) {
-    throw new Error(`head failed: ${response.status} ${url}`)
-  }
-  const contentLength = response.headers.get('content-length')
-  return contentLength != null ? Number(contentLength) : null
-}
-
-const downloadToFile = async (url, destPath, expectedSize) => {
+const hashFileOnce = async (url) => {
   const response = await fetch(url, { headers: { 'User-Agent': USER_AGENT } })
   if (!response.ok) {
     throw new Error(`status: ${response.status} ${url}`)
@@ -171,51 +115,7 @@ const downloadToFile = async (url, destPath, expectedSize) => {
   if (!response.body) {
     throw new Error(`no body: ${url}`)
   }
-
-  const headerSize = response.headers.get('content-length')
-  const expected = headerSize != null ? Number(headerSize) : expectedSize
-  const tmpPath = `${destPath}.part`
-  fs.mkdirSync(path.dirname(destPath), { recursive: true })
-  if (fs.existsSync(tmpPath)) {
-    fs.unlinkSync(tmpPath)
-  }
-
-  await pipeline(Readable.fromWeb(response.body), fs.createWriteStream(tmpPath))
-  const written = fs.statSync(tmpPath).size
-  if (expected != null && written !== expected) {
-    fs.unlinkSync(tmpPath)
-    throw new Error(`incomplete download: ${written}/${expected} bytes ${url}`)
-  }
-
-  fs.renameSync(tmpPath, destPath)
-  return written
-}
-
-const ensureDownloaded = async (url, localPath) => {
-  const expectedSize = await fetchExpectedSize(url)
-  if (fs.existsSync(localPath)) {
-    const { size } = fs.statSync(localPath)
-    if (expectedSize == null || size === expectedSize) {
-      return { cached: true, bytes: size }
-    }
-    fs.unlinkSync(localPath)
-  }
-
-  const bytes = await downloadToFile(url, localPath, expectedSize)
-  return { cached: false, bytes }
-}
-
-const hashLocalFile = async (filePath, { gunzip = false } = {}) =>
-  hashStream(fs.createReadStream(filePath), { gunzip })
-
-const hashFileOnce = async (url, key, cacheDir) => {
-  const localPath = cacheFilePath(cacheDir, key)
-  const { cached, bytes } = await ensureDownloaded(url, localPath)
-  console.log(cached ? 'using download' : 'downloaded', key, `${(bytes / (1024 * 1024)).toFixed(1)} MB`)
-  console.log('hashing', key)
-  const digest = await hashLocalFile(localPath, { gunzip: isGzipUrl(url) })
-  fs.unlinkSync(localPath)
-  return digest
+  return hashStream(response.body)
 }
 
 const isNonRetryableError = (e) =>
@@ -241,8 +141,7 @@ const withRetries = async (label, fn) => {
   throw lastError
 }
 
-const hashFile = async (url, key, cacheDir) =>
-  withRetries(url, () => hashFileOnce(url, key, cacheDir))
+const hashFile = async (url) => withRetries(url, () => hashFileOnce(url))
 
 const loadDoneKeys = (filePath) => {
   const done = new Set()
@@ -304,7 +203,6 @@ const formatDuration = (ms) => {
 
 export const collectHumanGenomeHashes = async (outputPath = DEFAULT_OUTPUT) => {
   const done = loadDoneKeys(outputPath)
-  const cacheDir = sidecarPath(outputPath, 'cache')
   console.log('already hashed:', done.size)
 
   const files = (await spiderFiles(ROOT_URLS)).filter((url) => !isIndexUrl(url))
@@ -321,7 +219,7 @@ export const collectHumanGenomeHashes = async (outputPath = DEFAULT_OUTPUT) => {
     attempted++
     console.log(`fetching ${attempted}/${todoFiles.length}`, key)
     try {
-      const digest = await hashFile(url, key, cacheDir)
+      const digest = await hashFile(url)
       appendHash(outputPath, key, digest)
       done.add(key)
       hashed++

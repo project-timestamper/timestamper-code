@@ -12,24 +12,30 @@ const SERIES = {
   // Statutory Invention Registrations (program ended 2013).
   H: { prefix: 'H', stop: 2_294 },
   // Additions of Improvements (historical).
-  AI: { prefix: 'AI', stop: 318 }
+  AI: { prefix: 'AI', stop: 318 },
+  // Defensive Publications (1968–1985): T100001–T109201 and older T856001–T990001.
+  T: { prefix: 'T', start: 100_001, stop: 990_001 }
 }
 
 // USPTO ids are at least 7 chars: prefix + zero-padded number.
 const formatId = (prefix, n) =>
   prefix + String(n).padStart(Math.max(0, 7 - prefix.length), '0')
 
+const seriesStart = (cfg) => cfg.start ?? 1
+
 const SERIES_BY_PREFIX = Object.entries(SERIES)
   .sort((a, b) => b[1].prefix.length - a[1].prefix.length)
 
 const parseId = (id) => {
-  for (const [series, { prefix, stop }] of SERIES_BY_PREFIX) {
+  for (const [series, cfg] of SERIES_BY_PREFIX) {
+    const { prefix, stop } = cfg
+    const start = seriesStart(cfg)
     const rest = prefix === '' ? id : id.startsWith(prefix) ? id.slice(prefix.length) : null
     if (rest === null || !/^\d+$/.test(rest)) {
       continue
     }
     const n = Number(rest)
-    if (n >= 1 && n <= stop) {
+    if (n >= start && n <= stop) {
       return { series, n }
     }
   }
@@ -49,7 +55,10 @@ const sleep = (ms) => new Promise((resolve) => setTimeout(resolve, ms))
 
 const progress = {
   startedAt: Date.now(),
-  total: Object.values(SERIES).reduce((sum, { stop }) => sum + stop, 0),
+  total: Object.values(SERIES).reduce(
+    (sum, cfg) => sum + (cfg.stop - seriesStart(cfg) + 1),
+    0
+  ),
   done: 0,
   hashed: 0,
   previous: 0
@@ -62,8 +71,8 @@ const formatDuration = (ms) => {
 
 const createAttempted = () => {
   const bits = {}
-  for (const [series, { stop }] of Object.entries(SERIES)) {
-    bits[series] = new Uint8Array(Math.ceil((stop + 1) / 8))
+  for (const [series, cfg] of Object.entries(SERIES)) {
+    bits[series] = new Uint8Array(Math.ceil((cfg.stop + 1) / 8))
   }
   return bits
 }
@@ -184,10 +193,10 @@ async function processOne ({ id, series, n, bits }) {
   return 'error'
 }
 
-async function runSeries ({ series, prefix, stop, bits, progress }) {
-  console.log(`Starting: series=${series} range=[1, ${stop}]`)
+async function runSeries ({ series, prefix, start, stop, bits, progress }) {
+  console.log(`Starting: series=${series} range=[${start}, ${stop}]`)
 
-  for (let n = 1; n <= stop; n++) {
+  for (let n = start; n <= stop; n++) {
     const id = formatId(prefix, n)
     if (hasAttempted(bits, series, n)) {
       progress.previous++
@@ -218,6 +227,8 @@ async function runSeries ({ series, prefix, stop, bits, progress }) {
 const { bits, count } = loadAttempted()
 console.log(`Loaded ${count} attempted ids from ${ATTEMPTED_PATH}`)
 
-for (const [series, { prefix, stop }] of Object.entries(SERIES)) {
-  await runSeries({ series, prefix, stop, bits, progress })
+for (const [series, cfg] of Object.entries(SERIES)) {
+  const { prefix, stop } = cfg
+  const start = seriesStart(cfg)
+  await runSeries({ series, prefix, start, stop, bits, progress })
 }
