@@ -1,7 +1,13 @@
-import { createHash } from 'node:crypto'
 import fs from 'node:fs'
 import minimist from 'minimist'
 import esMain from 'es-main'
+import {
+  appendHash,
+  formatDuration,
+  hashStream,
+  loadDoneKeys,
+  withRetries
+} from './util.js'
 
 const ROOT_URLS = [
   'https://ftp.1000genomes.ebi.ac.uk/vol1/ftp/technical/reference/',
@@ -15,8 +21,6 @@ const USER_AGENT = 'timestamper/0.0.1 (https://github.com/arthuredelstein/timest
 const DEFAULT_OUTPUT = 'human_genome_hashes.txt'
 const HASH_RETRIES = 5
 const RETRY_DELAY_MS = 10000
-
-const sleep = (ms) => new Promise(resolve => setTimeout(resolve, ms))
 
 const normalizeDirUrl = (url) => (url.endsWith('/') ? url : `${url}/`)
 
@@ -99,14 +103,6 @@ const pathnameOf = (url) => {
 
 const isIndexUrl = (url) => /\.(?:tbi|csi)$/i.test(pathnameOf(url))
 
-const hashStream = async (body) => {
-  const hash = createHash('sha256')
-  for await (const chunk of body) {
-    hash.update(chunk)
-  }
-  return hash.digest('hex')
-}
-
 const hashFileOnce = async (url) => {
   const response = await fetch(url, { headers: { 'User-Agent': USER_AGENT } })
   if (!response.ok) {
@@ -118,88 +114,11 @@ const hashFileOnce = async (url) => {
   return hashStream(response.body)
 }
 
-const isNonRetryableError = (e) =>
-  /status: (?:40[134]|410|451)\b/.test(e.message)
-
-const withRetries = async (label, fn) => {
-  let lastError
-  for (let attempt = 1; attempt <= HASH_RETRIES; attempt++) {
-    try {
-      return await fn()
-    } catch (e) {
-      lastError = e
-      if (isNonRetryableError(e)) {
-        throw e
-      }
-      const cause = e.cause ? ` (${e.cause.message || e.cause})` : ''
-      console.error(`retry ${attempt}/${HASH_RETRIES}`, label, `${e.message}${cause}`)
-      if (attempt < HASH_RETRIES) {
-        await sleep(RETRY_DELAY_MS * attempt)
-      }
-    }
-  }
-  throw lastError
-}
-
-const hashFile = async (url) => withRetries(url, () => hashFileOnce(url))
-
-const loadDoneKeys = (filePath) => {
-  const done = new Set()
-  if (!fs.existsSync(filePath)) {
-    return done
-  }
-  const fd = fs.openSync(filePath, 'r')
-  const bufSize = 1024 * 1024
-  const buf = Buffer.alloc(bufSize)
-  let leftover = ''
-  try {
-    while (true) {
-      const bytesRead = fs.readSync(fd, buf, 0, bufSize, null)
-      if (bytesRead === 0) {
-        break
-      }
-      leftover += buf.toString('utf8', 0, bytesRead)
-      const lines = leftover.split('\n')
-      leftover = lines.pop()
-      for (const line of lines) {
-        if (!line) {
-          continue
-        }
-        const [key, digest] = line.split('\t')
-        if (key && digest) {
-          done.add(key)
-        }
-      }
-    }
-    if (leftover) {
-      const [key, digest] = leftover.split('\t')
-      if (key && digest) {
-        done.add(key)
-      }
-    }
-  } finally {
-    fs.closeSync(fd)
-  }
-  return done
-}
-
-const appendHash = (filePath, key, digest) => {
-  fs.appendFileSync(filePath, `${key}\t${digest}\n`)
-}
-
-const formatDuration = (ms) => {
-  const totalSec = Math.max(0, Math.round(ms / 1000))
-  const h = Math.floor(totalSec / 3600)
-  const m = Math.floor((totalSec % 3600) / 60)
-  const s = totalSec % 60
-  if (h > 0) {
-    return `${h}h ${m}m ${s}s`
-  }
-  if (m > 0) {
-    return `${m}m ${s}s`
-  }
-  return `${s}s`
-}
+const hashFile = async (url) =>
+  withRetries(url, () => hashFileOnce(url), {
+    retries: HASH_RETRIES,
+    delayMs: RETRY_DELAY_MS
+  })
 
 export const collectHumanGenomeHashes = async (outputPath = DEFAULT_OUTPUT) => {
   const done = loadDoneKeys(outputPath)

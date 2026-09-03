@@ -42,6 +42,7 @@
     "puppeteer-extra-plugin-stealth": "^2.11.2",
     "rfc4648": "^1.5.4",
     "tar": "^7.5.22",
+    "unzipper": "^0.12.5",
     "ytdl-core": "^4.11.5"
   },
   "devDependencies": {
