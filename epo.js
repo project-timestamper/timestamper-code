@@ -1,5 +1,6 @@
+import fs from 'node:fs'
 import path from 'node:path'
-import { Readable } from 'node:stream'
+import { spawn } from 'node:child_process'
 import minimist from 'minimist'
 import esMain from 'es-main'
 import * as tar from 'tar'
@@ -21,6 +22,7 @@ const API_BASE = 'https://publication-bdds.apps.epo.org/bdds/bdds-bff-service/pr
 const PRODUCT_ID = 32
 const USER_AGENT = 'timestamper/0.0.1 (https://github.com/arthuredelstein/timestamper)'
 const DEFAULT_OUTPUT = 'epo_hashes.txt'
+const DEFAULT_CACHE_DIR = 'epo_cache'
 const FETCH_RETRIES = 5
 const RETRY_DELAY_MS = 10000
 
@@ -32,6 +34,11 @@ const isZipPath = (p) => /\.zip$/i.test(p)
 const isTarPath = (p) => /\.tar$/i.test(p)
 
 const pdfKey = (entryPath) => path.basename(entryPath).replace(/\.pdf$/i, '')
+
+const cachePathFor = (cacheDir, item) => {
+  const safeName = path.basename(item.itemName).replace(/[^\w.-]+/g, '_')
+  return path.join(cacheDir, `${item.itemId}_${safeName}`)
+}
 
 const listDeliveryItems = async () => {
   const response = await fetch(`${API_BASE}/public/products/${PRODUCT_ID}`, {
@@ -55,16 +62,52 @@ const listDeliveryItems = async () => {
   return { name: product.name, items }
 }
 
-const openDownloadStream = async (item) => {
-  const url = downloadUrl(item.deliveryId, item.itemId)
-  const response = await fetch(url, { headers: { 'User-Agent': USER_AGENT } })
-  if (!response.ok) {
-    throw new Error(`status: ${response.status} ${url}`)
+/** Download (or resume) an archive with curl -C -. Leaves partial files for later retry. */
+const downloadWithCurl = async (url, destPath) => {
+  await fs.promises.mkdir(path.dirname(destPath), { recursive: true })
+  const partial = fs.existsSync(destPath) ? fs.statSync(destPath).size : 0
+  if (partial > 0) {
+    console.log('resuming download from', partial, 'bytes ->', destPath)
+  } else {
+    console.log('downloading ->', destPath)
   }
-  if (!response.body) {
-    throw new Error(`no body: ${url}`)
+
+  await new Promise((resolve, reject) => {
+    const child = spawn(
+      'curl',
+      [
+        '-fL',
+        '--retry', '5',
+        '--retry-delay', '5',
+        '-C', '-',
+        '-A', USER_AGENT,
+        '--connect-timeout', '30',
+        '-o', destPath,
+        url
+      ],
+      { stdio: ['ignore', 'inherit', 'inherit'] }
+    )
+    child.on('error', reject)
+    child.on('close', (code, signal) => {
+      if (code === 0) {
+        resolve()
+        return
+      }
+      // curl 33: HTTP 416 when local file is already complete — treat as success.
+      if (code === 33 && fs.existsSync(destPath) && fs.statSync(destPath).size > 0) {
+        console.log('curl 416 (already complete), continuing')
+        resolve()
+        return
+      }
+      reject(new Error(signal ? `curl killed (${signal})` : `curl exit ${code}`))
+    })
+  })
+
+  const size = fs.statSync(destPath).size
+  if (size <= 0) {
+    throw new Error(`empty download: ${destPath}`)
   }
-  return Readable.fromWeb(response.body)
+  console.log('download complete', size, 'bytes')
 }
 
 const recordPdf = async (entryPath, body, outputPath, done) => {
@@ -208,15 +251,33 @@ const hashPdfsInTarStream = async (input, outputPath, done) => {
   return hashed
 }
 
-const hashPdfsFromDownload = async (item, outputPath, done) => {
-  const input = await openDownloadStream(item)
-  if (isZipPath(item.itemName)) {
-    return hashPdfsInZipStream(input, outputPath, done)
+const hashPdfsFromFile = async (filePath, itemName, outputPath, done) => {
+  const input = fs.createReadStream(filePath)
+  try {
+    if (isZipPath(itemName)) {
+      return await hashPdfsInZipStream(input, outputPath, done)
+    }
+    if (isTarPath(itemName)) {
+      return await hashPdfsInTarStream(input, outputPath, done)
+    }
+    throw new Error(`unsupported archive type: ${itemName}`)
+  } finally {
+    input.destroy()
   }
-  if (isTarPath(item.itemName)) {
-    return hashPdfsInTarStream(input, outputPath, done)
+}
+
+const hashPdfsFromDownload = async (item, outputPath, done, cacheDir) => {
+  const url = downloadUrl(item.deliveryId, item.itemId)
+  const destPath = cachePathFor(cacheDir, item)
+  await downloadWithCurl(url, destPath)
+  const hashed = await hashPdfsFromFile(destPath, item.itemName, outputPath, done)
+  try {
+    await fs.promises.unlink(destPath)
+    console.log('removed cache file', destPath)
+  } catch (e) {
+    console.warn('could not remove cache file', destPath, e.message)
   }
-  throw new Error(`unsupported archive type: ${item.itemName}`)
+  return hashed
 }
 
 const parseSizeGB = (fileSize) => {
@@ -240,6 +301,7 @@ const parseSizeGB = (fileSize) => {
 
 export const collectEpoHashes = async ({
   outputPath = DEFAULT_OUTPUT,
+  cacheDir = DEFAULT_CACHE_DIR,
   limit = Infinity,
   start = 0
 } = {}) => {
@@ -248,6 +310,7 @@ export const collectEpoHashes = async ({
   const completed = loadLineSet(completedPath)
   console.log('already hashed pdfs:', done.size)
   console.log('completed archives:', completed.size)
+  console.log('cache dir:', cacheDir)
 
   const { name, items } = await listDeliveryItems()
   console.log('product:', name)
@@ -276,7 +339,7 @@ export const collectEpoHashes = async ({
     try {
       const n = await withRetries(
         item.itemName,
-        () => hashPdfsFromDownload(item, outputPath, done),
+        () => hashPdfsFromDownload(item, outputPath, done, cacheDir),
         { retries: FETCH_RETRIES, delayMs: RETRY_DELAY_MS }
       )
       pdfsHashed += n
@@ -301,13 +364,14 @@ export const collectEpoHashes = async ({
 
 const main = async () => {
   const args = minimist(process.argv.slice(2), {
-    default: { output: DEFAULT_OUTPUT, limit: 0, start: 0 },
-    alias: { o: 'output', n: 'limit' },
-    string: ['output']
+    default: { output: DEFAULT_OUTPUT, cache: DEFAULT_CACHE_DIR, limit: 0, start: 0 },
+    alias: { o: 'output', n: 'limit', c: 'cache' },
+    string: ['output', 'cache']
   })
   const limit = args.limit > 0 ? args.limit : Infinity
   const hashed = await collectEpoHashes({
     outputPath: args.output,
+    cacheDir: args.cache,
     limit,
     start: args.start
   })
