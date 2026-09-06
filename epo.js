@@ -3,18 +3,13 @@ import path from 'node:path'
 import { spawn } from 'node:child_process'
 import minimist from 'minimist'
 import esMain from 'es-main'
-import * as tar from 'tar'
-import unzipper from 'unzipper'
 import {
   appendHash,
   appendLine,
-  drainStream,
   formatDuration,
-  hashStream,
   loadDoneKeys,
   loadLineSet,
   sidecarPath,
-  streamToBuffer,
   withRetries
 } from './util.js'
 
@@ -40,6 +35,9 @@ const cachePathFor = (cacheDir, item) => {
   return path.join(cacheDir, `${item.itemId}_${safeName}`)
 }
 
+const workDirFor = (cacheDir, item) =>
+  path.join(cacheDir, `work_${item.itemId}`)
+
 const listDeliveryItems = async () => {
   const response = await fetch(`${API_BASE}/public/products/${PRODUCT_ID}`, {
     headers: { Accept: 'application/json', 'User-Agent': USER_AGENT }
@@ -62,18 +60,77 @@ const listDeliveryItems = async () => {
   return { name: product.name, items }
 }
 
-const runCurl = (args) =>
+const runCommand = (command, args) =>
   new Promise((resolve, reject) => {
-    const child = spawn('curl', args, { stdio: ['ignore', 'inherit', 'inherit'] })
+    console.log('+', command, args.join(' '))
+    const child = spawn(command, args, { stdio: ['ignore', 'inherit', 'inherit'] })
     child.on('error', reject)
     child.on('close', (code, signal) => {
       if (signal) {
-        reject(new Error(`curl killed (${signal})`))
+        reject(new Error(`${command} killed (${signal})`))
         return
       }
       resolve(code ?? 1)
     })
   })
+
+const runCommandCapture = (command, args) =>
+  new Promise((resolve, reject) => {
+    const chunks = []
+    const errChunks = []
+    const child = spawn(command, args, { stdio: ['ignore', 'pipe', 'pipe'] })
+    child.stdout.on('data', (d) => chunks.push(d))
+    child.stderr.on('data', (d) => errChunks.push(d))
+    child.on('error', reject)
+    child.on('close', (code, signal) => {
+      if (signal) {
+        reject(new Error(`${command} killed (${signal})`))
+        return
+      }
+      const stdout = Buffer.concat(chunks).toString('utf8')
+      const stderr = Buffer.concat(errChunks).toString('utf8')
+      if (code !== 0) {
+        reject(new Error(`${command} exit ${code}: ${stderr || stdout}`))
+        return
+      }
+      resolve(stdout)
+    })
+  })
+
+/** Prefer sha256sum (Linux); fall back to shasum -a 256 (macOS). */
+let sha256Tool = null
+const getSha256Tool = async () => {
+  if (sha256Tool) {
+    return sha256Tool
+  }
+  try {
+    await runCommandCapture('sha256sum', ['/dev/null'])
+    sha256Tool = { command: 'sha256sum', argsFor: (file) => [file] }
+    return sha256Tool
+  } catch {
+    // ignore
+  }
+  try {
+    await runCommandCapture('shasum', ['-a', '256', '/dev/null'])
+    sha256Tool = { command: 'shasum', argsFor: (file) => ['-a', '256', file] }
+    return sha256Tool
+  } catch {
+    // ignore
+  }
+  throw new Error('neither sha256sum nor shasum found')
+}
+
+const sha256File = async (filePath) => {
+  const tool = await getSha256Tool()
+  const stdout = await runCommandCapture(tool.command, tool.argsFor(filePath))
+  const digest = stdout.trim().split(/\s+/)[0]
+  if (!/^[0-9a-f]{64}$/i.test(digest)) {
+    throw new Error(`bad sha256 output for ${filePath}: ${stdout.trim()}`)
+  }
+  return digest.toLowerCase()
+}
+
+const runCurl = (args) => runCommand('curl', args)
 
 /** Content-Length after redirects, or null if missing. */
 const getContentLength = async (url) => {
@@ -105,15 +162,12 @@ const getContentLength = async (url) => {
 const localFileSize = (destPath) =>
   (fs.existsSync(destPath) ? fs.statSync(destPath).size : 0)
 
-const removeCacheFile = async (destPath) => {
+const removePath = async (target) => {
   try {
-    await fs.promises.unlink(destPath)
+    await fs.promises.rm(target, { recursive: true, force: true })
     return true
   } catch (e) {
-    if (e.code === 'ENOENT') {
-      return false
-    }
-    console.warn('could not remove cache file', destPath, e.message)
+    console.warn('could not remove', target, e.message)
     return false
   }
 }
@@ -175,216 +229,149 @@ const downloadWithCurl = async (url, destPath) => {
       console.log('download complete', localFileSize(destPath), 'bytes')
       return
     }
-    // No Content-Length: trust a clean curl exit (ranges worked and finished).
     if (expected == null && code === 0 && localFileSize(destPath) > 0) {
       console.log('download complete', localFileSize(destPath), 'bytes')
       return
     }
-    // curl 33 = ranges not supported / 416 on incomplete file; or still short.
     console.warn(
       `resume incomplete (curl exit ${code}, size ${localFileSize(destPath)}` +
       `${expected != null ? `, expected ${expected}` : ''}); re-downloading from scratch`
     )
-    await removeCacheFile(destPath)
+    await removePath(destPath)
   }
 
   console.log('downloading ->', destPath)
   const code = await runCurl(curlDownloadArgs(url, destPath, { resume: false }))
   if (code !== 0) {
-    await removeCacheFile(destPath)
+    await removePath(destPath)
     throw new Error(`curl exit ${code}`)
   }
 
   const size = localFileSize(destPath)
   if (size <= 0) {
-    await removeCacheFile(destPath)
+    await removePath(destPath)
     throw new Error(`empty download: ${destPath}`)
   }
   if (expected != null && size !== expected) {
-    await removeCacheFile(destPath)
+    await removePath(destPath)
     throw new Error(`size mismatch: got ${size}, expected ${expected}`)
   }
   console.log('download complete', size, 'bytes')
 }
 
-const recordPdf = async (entryPath, body, outputPath, done) => {
-  const key = pdfKey(entryPath)
+async function * walkFiles (dir) {
+  const entries = await fs.promises.readdir(dir, { withFileTypes: true })
+  for (const ent of entries) {
+    const full = path.join(dir, ent.name)
+    if (ent.isDirectory()) {
+      yield * walkFiles(full)
+    } else if (ent.isFile()) {
+      yield full
+    }
+  }
+}
+
+const extractZip = async (zipPath, destDir) => {
+  await fs.promises.mkdir(destDir, { recursive: true })
+  // unzip: 0 = ok, 1 = success with warnings (e.g. backslashes)
+  const code = await runCommand('unzip', ['-q', '-o', zipPath, '-d', destDir])
+  if (code > 1) {
+    throw new Error(`unzip exit ${code}: ${zipPath}`)
+  }
+}
+
+const extractTar = async (tarPath, destDir) => {
+  await fs.promises.mkdir(destDir, { recursive: true })
+  const code = await runCommand('tar', ['-xf', tarPath, '-C', destDir])
+  if (code !== 0) {
+    throw new Error(`tar exit ${code}: ${tarPath}`)
+  }
+}
+
+const extractArchive = async (archivePath, workDir) => {
+  if (isZipPath(archivePath)) {
+    await extractZip(archivePath, workDir)
+    return
+  }
+  if (isTarPath(archivePath)) {
+    await extractTar(archivePath, workDir)
+    return
+  }
+  throw new Error(`unsupported archive type: ${archivePath}`)
+}
+
+/** Unzip nested .zip files in place until none remain. */
+const expandNestedZips = async (workDir) => {
+  for (;;) {
+    const zips = []
+    for await (const filePath of walkFiles(workDir)) {
+      if (isZipPath(filePath)) {
+        zips.push(filePath)
+      }
+    }
+    if (zips.length === 0) {
+      return
+    }
+    console.log('expanding nested zips:', zips.length)
+    for (const zipPath of zips) {
+      const destDir = zipPath.replace(/\.zip$/i, '')
+      await extractZip(zipPath, destDir)
+      await removePath(zipPath)
+    }
+  }
+}
+
+const hashPdfFile = async (filePath, outputPath, done) => {
+  const key = pdfKey(filePath)
   if (done.has(key)) {
-    await drainStream(body)
     return false
   }
-  const digest = await hashStream(body)
+  const digest = await sha256File(filePath)
   appendHash(outputPath, key, digest)
   done.add(key)
   console.log(key, digest)
   return true
 }
 
-const hashPdfsInZipBuffer = async (zipBuf, outputPath, done) => {
+const hashPdfsInWorkDir = async (workDir, outputPath, done) => {
   let hashed = 0
-  const directory = await unzipper.Open.buffer(zipBuf)
-  for (const entry of directory.files) {
-    if (entry.type === 'Directory') {
+  for await (const filePath of walkFiles(workDir)) {
+    if (!isPdfPath(filePath)) {
       continue
     }
-    if (isPdfPath(entry.path)) {
-      if (await recordPdf(entry.path, entry.stream(), outputPath, done)) {
-        hashed++
-      }
-    } else if (isZipPath(entry.path)) {
-      const nestedBuf = await streamToBuffer(entry.stream())
-      hashed += await hashPdfsInZipBuffer(nestedBuf, outputPath, done)
+    if (await hashPdfFile(filePath, outputPath, done)) {
+      hashed++
     }
   }
   return hashed
 }
 
-// Stream a zip body from HTTP and hash PDFs; nested zips are buffered in memory.
-const hashPdfsInZipStream = async (input, outputPath, done) => {
-  let hashed = 0
-  let chain = Promise.resolve()
-  let failed = null
-
-  await new Promise((resolve, reject) => {
-    const parser = unzipper.Parse()
-    input.pipe(parser)
-
-    parser.on('entry', (entry) => {
-      chain = chain.then(async () => {
-        if (failed) {
-          entry.autodrain()
-          return
-        }
-        try {
-          if (isPdfPath(entry.path)) {
-            if (await recordPdf(entry.path, entry, outputPath, done)) {
-              hashed++
-            }
-            return
-          }
-          if (isZipPath(entry.path)) {
-            const nestedBuf = await streamToBuffer(entry)
-            hashed += await hashPdfsInZipBuffer(nestedBuf, outputPath, done)
-            return
-          }
-          entry.autodrain()
-        } catch (e) {
-          failed = e
-          try {
-            entry.autodrain()
-          } catch {
-            // ignore
-          }
-        }
-      })
-    })
-
-    parser.on('finish', () => {
-      chain.then(() => (failed ? reject(failed) : resolve()), reject)
-    })
-    parser.on('error', reject)
-    input.on('error', reject)
-  })
-
+const hashPdfsFromArchiveFile = async (archivePath, workDir, outputPath, done) => {
+  await removePath(workDir)
+  console.log('extracting', archivePath, '->', workDir)
+  await extractArchive(archivePath, workDir)
+  await expandNestedZips(workDir)
+  const hashed = await hashPdfsInWorkDir(workDir, outputPath, done)
+  await removePath(workDir)
+  console.log('removed work dir', workDir)
   return hashed
-}
-
-const hashPdfsInTarStream = async (input, outputPath, done) => {
-  let hashed = 0
-  let chain = Promise.resolve()
-  let failed = null
-  const parser = new tar.Parser()
-
-  await new Promise((resolve, reject) => {
-    parser.on('entry', (entry) => {
-      input.pause()
-      chain = chain.then(async () => {
-        if (failed) {
-          entry.resume()
-          input.resume()
-          return
-        }
-        try {
-          if (entry.type !== 'File') {
-            entry.resume()
-            return
-          }
-          if (isPdfPath(entry.path)) {
-            if (await recordPdf(entry.path, entry, outputPath, done)) {
-              hashed++
-            }
-            return
-          }
-          if (isZipPath(entry.path)) {
-            const nestedBuf = await streamToBuffer(entry)
-            hashed += await hashPdfsInZipBuffer(nestedBuf, outputPath, done)
-            return
-          }
-          entry.resume()
-        } catch (e) {
-          failed = e
-          try {
-            entry.resume()
-          } catch {
-            // ignore
-          }
-        } finally {
-          input.resume()
-        }
-      })
-    })
-
-    const finish = () => {
-      chain.then(() => (failed ? reject(failed) : resolve()), reject)
-    }
-
-    parser.on('end', finish)
-    parser.on('finish', finish)
-    parser.on('error', reject)
-    input.on('error', reject)
-    input.pipe(parser)
-  })
-
-  return hashed
-}
-
-const hashPdfsFromFile = async (filePath, itemName, outputPath, done) => {
-  const input = fs.createReadStream(filePath)
-  try {
-    if (isZipPath(itemName)) {
-      return await hashPdfsInZipStream(input, outputPath, done)
-    }
-    if (isTarPath(itemName)) {
-      return await hashPdfsInTarStream(input, outputPath, done)
-    }
-    throw new Error(`unsupported archive type: ${itemName}`)
-  } finally {
-    await new Promise((resolve) => {
-      if (input.destroyed) {
-        resolve()
-        return
-      }
-      input.once('close', resolve)
-      input.destroy()
-    })
-  }
 }
 
 const hashPdfsFromDownload = async (item, outputPath, done, cacheDir) => {
   const url = downloadUrl(item.deliveryId, item.itemId)
   const destPath = cachePathFor(cacheDir, item)
+  const workDir = workDirFor(cacheDir, item)
   await downloadWithCurl(url, destPath)
   try {
-    const hashed = await hashPdfsFromFile(destPath, item.itemName, outputPath, done)
-    // Free disk once every PDF in the archive has been hashed.
-    if (await removeCacheFile(destPath)) {
+    const hashed = await hashPdfsFromArchiveFile(destPath, workDir, outputPath, done)
+    if (await removePath(destPath)) {
       console.log('removed cache file', destPath)
     }
     return hashed
   } catch (e) {
-    // Corrupt or truncated archive: drop cache so the next retry is a clean fetch.
-    console.warn('parse failed; removing cache file', destPath)
-    await removeCacheFile(destPath)
+    await removePath(workDir)
+    // Keep a size-complete archive for extract-only retries; drop obvious junk.
+    console.warn('extract/hash failed; keeping archive for retry:', destPath)
     throw e
   }
 }
