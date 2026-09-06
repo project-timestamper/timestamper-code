@@ -169,7 +169,8 @@ export const withRetries = async (label, fn, {
       const cause = e.cause ? ` (${e.cause.message || e.cause})` : ''
       console.error(`retry ${attempt}/${retries}`, label, `${e.message}${cause}`)
       if (attempt < retries) {
-        await sleep(delayMs * attempt)
+        const waitMs = e.retryAfterMs > 0 ? e.retryAfterMs : delayMs * attempt
+        await sleep(waitMs)
       }
     }
   }

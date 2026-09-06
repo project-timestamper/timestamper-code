@@ -62,50 +62,147 @@ const listDeliveryItems = async () => {
   return { name: product.name, items }
 }
 
-/** Download (or resume) an archive with curl -C -. Leaves partial files for later retry. */
-const downloadWithCurl = async (url, destPath) => {
-  await fs.promises.mkdir(path.dirname(destPath), { recursive: true })
-  const partial = fs.existsSync(destPath) ? fs.statSync(destPath).size : 0
-  if (partial > 0) {
-    console.log('resuming download from', partial, 'bytes ->', destPath)
-  } else {
-    console.log('downloading ->', destPath)
-  }
-
-  await new Promise((resolve, reject) => {
-    const child = spawn(
-      'curl',
-      [
-        '-fL',
-        '--retry', '5',
-        '--retry-delay', '5',
-        '-C', '-',
-        '-A', USER_AGENT,
-        '--connect-timeout', '30',
-        '-o', destPath,
-        url
-      ],
-      { stdio: ['ignore', 'inherit', 'inherit'] }
-    )
+const runCurl = (args) =>
+  new Promise((resolve, reject) => {
+    const child = spawn('curl', args, { stdio: ['ignore', 'inherit', 'inherit'] })
     child.on('error', reject)
     child.on('close', (code, signal) => {
-      if (code === 0) {
-        resolve()
+      if (signal) {
+        reject(new Error(`curl killed (${signal})`))
         return
       }
-      // curl 33: HTTP 416 when local file is already complete — treat as success.
-      if (code === 33 && fs.existsSync(destPath) && fs.statSync(destPath).size > 0) {
-        console.log('curl 416 (already complete), continuing')
-        resolve()
-        return
-      }
-      reject(new Error(signal ? `curl killed (${signal})` : `curl exit ${code}`))
+      resolve(code ?? 1)
     })
   })
 
-  const size = fs.statSync(destPath).size
+/** Content-Length after redirects, or null if missing. */
+const getContentLength = async (url) => {
+  const headers = await new Promise((resolve, reject) => {
+    const chunks = []
+    const child = spawn(
+      'curl',
+      ['-sI', '-L', '-A', USER_AGENT, '--connect-timeout', '30', url],
+      { stdio: ['ignore', 'pipe', 'pipe'] }
+    )
+    child.stdout.on('data', (d) => chunks.push(d))
+    child.stderr.on('data', () => {})
+    child.on('error', reject)
+    child.on('close', (code) => {
+      if (code !== 0) {
+        reject(new Error(`curl HEAD exit ${code}`))
+        return
+      }
+      resolve(Buffer.concat(chunks).toString('utf8'))
+    })
+  })
+  const matches = [...headers.matchAll(/content-length:\s*(\d+)/gi)]
+  if (matches.length === 0) {
+    return null
+  }
+  return Number(matches[matches.length - 1][1])
+}
+
+const localFileSize = (destPath) =>
+  (fs.existsSync(destPath) ? fs.statSync(destPath).size : 0)
+
+const removeCacheFile = async (destPath) => {
+  try {
+    await fs.promises.unlink(destPath)
+    return true
+  } catch (e) {
+    if (e.code === 'ENOENT') {
+      return false
+    }
+    console.warn('could not remove cache file', destPath, e.message)
+    return false
+  }
+}
+
+const curlDownloadArgs = (url, destPath, { resume } = { resume: false }) => {
+  const args = [
+    '-fL',
+    '--retry', '5',
+    '--retry-delay', '5',
+    '-A', USER_AGENT,
+    '--connect-timeout', '30'
+  ]
+  if (resume) {
+    args.push('-C', '-')
+  }
+  args.push('-o', destPath, url)
+  return args
+}
+
+/**
+ * Download an archive with curl. Prefer -C - resume when possible; if the server
+ * rejects ranges (curl 33) or the file is still short of Content-Length, delete
+ * the partial and download from scratch.
+ */
+const downloadWithCurl = async (url, destPath) => {
+  await fs.promises.mkdir(path.dirname(destPath), { recursive: true })
+
+  let expected = null
+  try {
+    expected = await getContentLength(url)
+  } catch (e) {
+    console.warn('could not read Content-Length:', e.message)
+  }
+  if (expected != null) {
+    console.log('expected size', expected, 'bytes')
+  }
+
+  const isComplete = () => {
+    const size = localFileSize(destPath)
+    if (size <= 0) {
+      return false
+    }
+    if (expected != null) {
+      return size === expected
+    }
+    return false
+  }
+
+  if (isComplete()) {
+    console.log('cache already complete', destPath)
+    return
+  }
+
+  const sizeBefore = localFileSize(destPath)
+  if (sizeBefore > 0) {
+    console.log('resuming download from', sizeBefore, 'bytes ->', destPath)
+    const code = await runCurl(curlDownloadArgs(url, destPath, { resume: true }))
+    if (isComplete()) {
+      console.log('download complete', localFileSize(destPath), 'bytes')
+      return
+    }
+    // No Content-Length: trust a clean curl exit (ranges worked and finished).
+    if (expected == null && code === 0 && localFileSize(destPath) > 0) {
+      console.log('download complete', localFileSize(destPath), 'bytes')
+      return
+    }
+    // curl 33 = ranges not supported / 416 on incomplete file; or still short.
+    console.warn(
+      `resume incomplete (curl exit ${code}, size ${localFileSize(destPath)}` +
+      `${expected != null ? `, expected ${expected}` : ''}); re-downloading from scratch`
+    )
+    await removeCacheFile(destPath)
+  }
+
+  console.log('downloading ->', destPath)
+  const code = await runCurl(curlDownloadArgs(url, destPath, { resume: false }))
+  if (code !== 0) {
+    await removeCacheFile(destPath)
+    throw new Error(`curl exit ${code}`)
+  }
+
+  const size = localFileSize(destPath)
   if (size <= 0) {
+    await removeCacheFile(destPath)
     throw new Error(`empty download: ${destPath}`)
+  }
+  if (expected != null && size !== expected) {
+    await removeCacheFile(destPath)
+    throw new Error(`size mismatch: got ${size}, expected ${expected}`)
   }
   console.log('download complete', size, 'bytes')
 }
@@ -262,7 +359,14 @@ const hashPdfsFromFile = async (filePath, itemName, outputPath, done) => {
     }
     throw new Error(`unsupported archive type: ${itemName}`)
   } finally {
-    input.destroy()
+    await new Promise((resolve) => {
+      if (input.destroyed) {
+        resolve()
+        return
+      }
+      input.once('close', resolve)
+      input.destroy()
+    })
   }
 }
 
@@ -270,14 +374,19 @@ const hashPdfsFromDownload = async (item, outputPath, done, cacheDir) => {
   const url = downloadUrl(item.deliveryId, item.itemId)
   const destPath = cachePathFor(cacheDir, item)
   await downloadWithCurl(url, destPath)
-  const hashed = await hashPdfsFromFile(destPath, item.itemName, outputPath, done)
   try {
-    await fs.promises.unlink(destPath)
-    console.log('removed cache file', destPath)
+    const hashed = await hashPdfsFromFile(destPath, item.itemName, outputPath, done)
+    // Free disk once every PDF in the archive has been hashed.
+    if (await removeCacheFile(destPath)) {
+      console.log('removed cache file', destPath)
+    }
+    return hashed
   } catch (e) {
-    console.warn('could not remove cache file', destPath, e.message)
+    // Corrupt or truncated archive: drop cache so the next retry is a clean fetch.
+    console.warn('parse failed; removing cache file', destPath)
+    await removeCacheFile(destPath)
+    throw e
   }
-  return hashed
 }
 
 const parseSizeGB = (fileSize) => {
