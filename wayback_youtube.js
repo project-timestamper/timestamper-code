@@ -15,7 +15,7 @@ const USER_AGENT = 'timestamper/0.0.1 (https://github.com/arthuredelstein/timest
 const DEFAULT_OUTPUT = 'wayback_youtube_hashes.txt'
 const CDX_RETRIES = 8
 const CDX_RETRY_DELAY_MS = 12000
-const CDX_PAGE_LIMIT = 150000
+const CDX_PAGE_LIMIT = 200000
 const PAGE_PAUSE_MS = 1000
 
 /** Primary YouTube media host in the Wayback Machine. */
