@@ -5,7 +5,6 @@ import {
   appendHash,
   cdxDigestToHex,
   formatDuration,
-  loadDoneKeys,
   sidecarPath,
   sleep,
   withRetries
@@ -29,23 +28,6 @@ const isAvMime = (mimetype) => {
   return mime.startsWith('video/') || mime.startsWith('audio/')
 }
 
-const loadSeenDigests = (filePath) => {
-  const digests = new Set()
-  if (!fs.existsSync(filePath)) {
-    return digests
-  }
-  for (const line of fs.readFileSync(filePath, 'utf8').split('\n')) {
-    if (!line) {
-      continue
-    }
-    const digest = line.split('\t')[1]
-    if (digest) {
-      digests.add(digest)
-    }
-  }
-  return digests
-}
-
 const fetchText = async (url) => {
   const response = await fetch(url, { headers })
   if (response.status === 429 || response.status === 503) {
@@ -67,8 +49,9 @@ const fetchText = async (url) => {
 }
 
 /**
- * Page CDX with resumeKey, writing matching rows as url\\tdigest (SHA-1 hex).
- * Filters status 200 and mimetype video/* or audio/* (server + client).
+ * Page CDX with resumeKey, appending matching rows as url\\tdigest (SHA-1 hex).
+ * No in-memory dedupe — unique digests later with:
+ *   sort -t $'\t' -k2,2 -u wayback_youtube_hashes.txt -o wayback_youtube_hashes.uniq.txt
  */
 export const collectWaybackYoutubeHashes = async ({
   outputPath = DEFAULT_OUTPUT,
@@ -76,16 +59,12 @@ export const collectWaybackYoutubeHashes = async ({
   pageLimit = CDX_PAGE_LIMIT
 } = {}) => {
   const resumePath = sidecarPath(outputPath, 'resume.txt')
-  const doneKeys = loadDoneKeys(outputPath)
-  const seenDigests = loadSeenDigests(outputPath)
   let resumeKey = fs.existsSync(resumePath)
     ? fs.readFileSync(resumePath, 'utf8').trim() || undefined
     : undefined
 
   console.log('output:', outputPath)
   console.log('cdx url:', cdxUrl)
-  console.log('already recorded urls:', doneKeys.size)
-  console.log('already recorded digests:', seenDigests.size)
   if (resumeKey) {
     console.log('resuming with resumeKey')
   }
@@ -161,12 +140,7 @@ export const collectWaybackYoutubeHashes = async ({
       if (!hex) {
         continue
       }
-      if (seenDigests.has(hex) || doneKeys.has(original)) {
-        continue
-      }
       appendHash(outputPath, original, hex)
-      doneKeys.add(original)
-      seenDigests.add(hex)
       written++
       pageMatches++
     }
