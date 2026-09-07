@@ -1,9 +1,9 @@
 import fs from 'node:fs'
 import minimist from 'minimist'
 import esMain from 'es-main'
-import { cdxDigestToHex } from './gutenberg-wayback.js'
 import {
   appendHash,
+  cdxDigestToHex,
   formatDuration,
   loadDoneKeys,
   sidecarPath,

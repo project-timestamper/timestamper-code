@@ -2,6 +2,7 @@ import fs from 'node:fs'
 import { createHash } from 'node:crypto'
 import { installIntoGlobal } from 'iterator-helpers-polyfill'
 import { execSync } from 'node:child_process'
+import { base32 } from 'rfc4648'
 installIntoGlobal()
 
 export const strToDate = (s) => {
@@ -175,4 +176,34 @@ export const withRetries = async (label, fn, {
     }
   }
   throw lastError
+}
+
+/** SHA-1 of empty payload in CDX base32 form. */
+const EMPTY_DIGEST_B32 = '3I42H3S6NNFQ2MSVX7XZKYAYSCX5QBYJ'
+
+/** Convert Wayback CDX digest (base32 SHA-1, optional sha1: prefix) to lowercase hex. */
+export const cdxDigestToHex = (digest) => {
+  if (!digest) {
+    return null
+  }
+  let value = String(digest).trim()
+  if (value.toLowerCase().startsWith('sha1:')) {
+    value = value.slice(5)
+  }
+  if (/^[0-9a-f]{40}$/i.test(value)) {
+    return value.toLowerCase()
+  }
+  const raw = value.toUpperCase().replace(/=+$/, '')
+  if (raw === EMPTY_DIGEST_B32) {
+    return null
+  }
+  try {
+    const bytes = base32.parse(raw, { loose: true })
+    if (bytes.length !== 20) {
+      return null
+    }
+    return Buffer.from(bytes).toString('hex')
+  } catch {
+    return null
+  }
 }
