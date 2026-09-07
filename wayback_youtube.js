@@ -21,14 +21,50 @@ const PAGE_PAUSE_MS = 1000
 /** Primary YouTube media host in the Wayback Machine. */
 const CDX_URL = '*.googlevideo.com/videoplayback*'
 
-const headers = { 'User-Agent': USER_AGENT, Accept: '*/*' }
+const headers = { 'User-Agent': USER_AGENT, Accept: 'text/plain' }
 
 const isAvMime = (mimetype) => {
   const mime = String(mimetype || '').toLowerCase()
   return mime.startsWith('video/') || mime.startsWith('audio/')
 }
 
-const fetchText = async (url) => {
+/** Yield lines from a web ReadableStream without buffering the whole body. */
+async function * readLines (body) {
+  const decoder = new TextDecoder()
+  let buf = ''
+  for await (const chunk of body) {
+    buf += decoder.decode(chunk, { stream: true })
+    let idx
+    while ((idx = buf.indexOf('\n')) >= 0) {
+      yield buf.slice(0, idx).replace(/\r$/, '')
+      buf = buf.slice(idx + 1)
+    }
+  }
+  buf += decoder.decode()
+  if (buf.length > 0) {
+    yield buf.replace(/\r$/, '')
+  }
+}
+
+/**
+ * Parse one CDX text line for fl=timestamp,original,mimetype,statuscode,digest,length.
+ * Trailing fields are fixed; original may theoretically contain spaces.
+ */
+const parseCdxLine = (line) => {
+  const parts = line.split(' ')
+  if (parts.length < 6) {
+    return null
+  }
+  const length = parts[parts.length - 1]
+  const digest = parts[parts.length - 2]
+  const statuscode = parts[parts.length - 3]
+  const mimetype = parts[parts.length - 4]
+  const timestamp = parts[0]
+  const original = parts.slice(1, -4).join(' ')
+  return { timestamp, original, mimetype, statuscode, digest, length }
+}
+
+const fetchCdxResponse = async (url) => {
   const response = await fetch(url, { headers })
   if (response.status === 429 || response.status === 503) {
     const err = new Error(`status: ${response.status} ${url}`)
@@ -41,15 +77,68 @@ const fetchText = async (url) => {
   if (!response.ok) {
     throw new Error(`status: ${response.status} ${url}`)
   }
-  const text = await response.text()
-  if (!text.trim()) {
-    throw new Error(`status: empty body ${url}`)
+  if (!response.body) {
+    throw new Error(`status: no body ${url}`)
   }
-  return text
+  return response
+}
+
+/**
+ * Stream one CDX page (newline-delimited). After rows, a blank line then resumeKey.
+ * Writes matches immediately; returns { pageScanned, pageWritten, nextResume }.
+ */
+const streamCdxPage = async (endpoint, outputPath) => {
+  const response = await fetchCdxResponse(endpoint)
+  let pageScanned = 0
+  let pageWritten = 0
+  let nextResume
+  let afterBlank = false
+  let sawRow = false
+
+  for await (const line of readLines(response.body)) {
+    if (!afterBlank && line === '') {
+      afterBlank = true
+      continue
+    }
+    if (afterBlank) {
+      if (line) {
+        nextResume = line
+      }
+      continue
+    }
+    if (!line) {
+      continue
+    }
+    sawRow = true
+    pageScanned++
+    const row = parseCdxLine(line)
+    if (!row) {
+      continue
+    }
+    if (String(row.mimetype || '').includes('warc/revisit')) {
+      continue
+    }
+    if (!isAvMime(row.mimetype)) {
+      continue
+    }
+    const hex = cdxDigestToHex(row.digest)
+    if (!hex) {
+      continue
+    }
+    appendHash(outputPath, row.original, hex)
+    pageWritten++
+  }
+
+  if (!sawRow && !nextResume) {
+    throw new Error(`status: empty body ${endpoint}`)
+  }
+
+  return { pageScanned, pageWritten, nextResume }
 }
 
 /**
  * Page CDX with resumeKey, appending matching rows as url\\tdigest (SHA-1 hex).
+ * Uses default newline-delimited CDX text (not JSON) and streams each page.
  * No in-memory dedupe — unique digests later with:
  *   sort -t $'\t' -k2,2 -u wayback_youtube_hashes.txt -o wayback_youtube_hashes.uniq.txt
  */
@@ -65,6 +154,7 @@ export const collectWaybackYoutubeHashes = async ({
 
   console.log('output:', outputPath)
   console.log('cdx url:', cdxUrl)
+  console.log('format: newline-delimited CDX text')
   if (resumeKey) {
     console.log('resuming with resumeKey')
   }
@@ -77,7 +167,6 @@ export const collectWaybackYoutubeHashes = async ({
   for (;;) {
     const params = new URLSearchParams()
     params.set('url', cdxUrl)
-    params.set('output', 'json')
     params.set('fl', 'timestamp,original,mimetype,statuscode,digest,length')
     params.set('limit', String(pageLimit))
     params.set('showResumeKey', 'true')
@@ -88,9 +177,9 @@ export const collectWaybackYoutubeHashes = async ({
     }
 
     const endpoint = `${CDX_API}?${params}`
-    const text = await withRetries(
+    const { pageScanned, pageWritten, nextResume } = await withRetries(
       cdxUrl,
-      () => fetchText(endpoint),
+      () => streamCdxPage(endpoint, outputPath),
       {
         retries: CDX_RETRIES,
         delayMs: CDX_RETRY_DELAY_MS,
@@ -98,57 +187,12 @@ export const collectWaybackYoutubeHashes = async ({
       }
     )
 
-    let data
-    try {
-      data = JSON.parse(text)
-    } catch {
-      throw new Error(`cdx non-json response: ${text.slice(0, 120)}`)
-    }
-    if (!Array.isArray(data) || data.length === 0) {
-      break
-    }
-
-    let nextResume
-    let body = data
-    if (
-      data.length >= 2 &&
-      Array.isArray(data[data.length - 2]) &&
-      data[data.length - 2].length === 0 &&
-      Array.isArray(data[data.length - 1]) &&
-      data[data.length - 1].length === 1
-    ) {
-      nextResume = data[data.length - 1][0]
-      body = data.slice(0, -2)
-    }
-
-    const start = body[0] && body[0][0] === 'timestamp' ? 1 : 0
-    let pageMatches = 0
-    for (let i = start; i < body.length; i++) {
-      const row = body[i]
-      if (!Array.isArray(row) || row.length < 5) {
-        continue
-      }
-      scanned++
-      const [, original, mimetype, , digest] = row
-      if (String(mimetype || '').includes('warc/revisit')) {
-        continue
-      }
-      if (!isAvMime(mimetype)) {
-        continue
-      }
-      const hex = cdxDigestToHex(digest)
-      if (!hex) {
-        continue
-      }
-      appendHash(outputPath, original, hex)
-      written++
-      pageMatches++
-    }
-
+    scanned += pageScanned
+    written += pageWritten
     pages++
     const elapsed = Date.now() - runStart
     console.log(
-      `page ${pages}: +${pageMatches} written ` +
+      `page ${pages}: +${pageWritten} written ` +
       `(scanned ${scanned}, total written ${written}, ` +
       `elapsed ${formatDuration(elapsed)})`
     )
