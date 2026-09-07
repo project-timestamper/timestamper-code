@@ -2,7 +2,7 @@ import fs from 'node:fs'
 import minimist from 'minimist'
 import esMain from 'es-main'
 import {
-  appendHash,
+  appendLine,
   cdxDigestToHex,
   formatDuration,
   sidecarPath,
@@ -23,11 +23,6 @@ const CDX_URL = '*.googlevideo.com/videoplayback*'
 
 const headers = { 'User-Agent': USER_AGENT, Accept: 'text/plain' }
 
-const isAvMime = (mimetype) => {
-  const mime = String(mimetype || '').toLowerCase()
-  return mime.startsWith('video/') || mime.startsWith('audio/')
-}
-
 /** Yield lines from a web ReadableStream without buffering the whole body. */
 async function * readLines (body) {
   const decoder = new TextDecoder()
@@ -44,24 +39,6 @@ async function * readLines (body) {
   if (buf.length > 0) {
     yield buf.replace(/\r$/, '')
   }
-}
-
-/**
- * Parse one CDX text line for fl=timestamp,original,mimetype,statuscode,digest,length.
- * Trailing fields are fixed; original may theoretically contain spaces.
- */
-const parseCdxLine = (line) => {
-  const parts = line.split(' ')
-  if (parts.length < 6) {
-    return null
-  }
-  const length = parts[parts.length - 1]
-  const digest = parts[parts.length - 2]
-  const statuscode = parts[parts.length - 3]
-  const mimetype = parts[parts.length - 4]
-  const timestamp = parts[0]
-  const original = parts.slice(1, -4).join(' ')
-  return { timestamp, original, mimetype, statuscode, digest, length }
 }
 
 const fetchCdxResponse = async (url) => {
@@ -84,8 +61,8 @@ const fetchCdxResponse = async (url) => {
 }
 
 /**
- * Stream one CDX page (newline-delimited). After rows, a blank line then resumeKey.
- * Writes matches immediately; returns { pageScanned, pageWritten, nextResume }.
+ * Stream one CDX page (newline-delimited, fl=digest). Blank line then resumeKey.
+ * Writes hex digests immediately; returns { pageScanned, pageWritten, nextResume }.
  */
 const streamCdxPage = async (endpoint, outputPath) => {
   const response = await fetchCdxResponse(endpoint)
@@ -111,21 +88,11 @@ const streamCdxPage = async (endpoint, outputPath) => {
     }
     sawRow = true
     pageScanned++
-    const row = parseCdxLine(line)
-    if (!row) {
-      continue
-    }
-    if (String(row.mimetype || '').includes('warc/revisit')) {
-      continue
-    }
-    if (!isAvMime(row.mimetype)) {
-      continue
-    }
-    const hex = cdxDigestToHex(row.digest)
+    const hex = cdxDigestToHex(line.trim())
     if (!hex) {
       continue
     }
-    appendHash(outputPath, row.original, hex)
+    appendLine(outputPath, hex)
     pageWritten++
   }
 
@@ -137,10 +104,10 @@ const streamCdxPage = async (endpoint, outputPath) => {
 }
 
 /**
- * Page CDX with resumeKey, appending matching rows as url\\tdigest (SHA-1 hex).
- * Uses default newline-delimited CDX text (not JSON) and streams each page.
+ * Page CDX with resumeKey, appending one SHA-1 hex digest per line (no URLs).
+ * Uses fl=digest only; status/mime still filtered on the server.
  * No in-memory dedupe — unique digests later with:
- *   sort -t $'\t' -k2,2 -u wayback_youtube_hashes.txt -o wayback_youtube_hashes.uniq.txt
+ *   sort -u wayback_youtube_hashes.txt -o wayback_youtube_hashes.uniq.txt
  */
 export const collectWaybackYoutubeHashes = async ({
   outputPath = DEFAULT_OUTPUT,
@@ -154,7 +121,7 @@ export const collectWaybackYoutubeHashes = async ({
 
   console.log('output:', outputPath)
   console.log('cdx url:', cdxUrl)
-  console.log('format: newline-delimited CDX text')
+  console.log('format: newline-delimited digests (fl=digest)')
   if (resumeKey) {
     console.log('resuming with resumeKey')
   }
@@ -167,7 +134,7 @@ export const collectWaybackYoutubeHashes = async ({
   for (;;) {
     const params = new URLSearchParams()
     params.set('url', cdxUrl)
-    params.set('fl', 'timestamp,original,mimetype,statuscode,digest,length')
+    params.set('fl', 'digest')
     params.set('limit', String(pageLimit))
     params.set('showResumeKey', 'true')
     params.append('filter', 'statuscode:200')
