@@ -110,35 +110,63 @@ export const streamToBuffer = async (body) => {
   return Buffer.concat(chunks)
 }
 
+const forEachLineSync = (filePath, onLine) => {
+  if (!fs.existsSync(filePath)) {
+    return
+  }
+  const fd = fs.openSync(filePath, 'r')
+  const bufSize = 1024 * 1024
+  const buf = Buffer.alloc(bufSize)
+  let leftover = ''
+  try {
+    for (;;) {
+      const bytesRead = fs.readSync(fd, buf, 0, bufSize, null)
+      if (bytesRead === 0) {
+        break
+      }
+      leftover += buf.toString('utf8', 0, bytesRead)
+      const lines = leftover.split('\n')
+      leftover = lines.pop()
+      for (const line of lines) {
+        onLine(line)
+      }
+    }
+    if (leftover) {
+      onLine(leftover)
+    }
+  } finally {
+    fs.closeSync(fd)
+  }
+}
+
 export const loadLineSet = (filePath) => {
   const values = new Set()
-  if (!fs.existsSync(filePath)) {
-    return values
-  }
-  for (const line of fs.readFileSync(filePath, 'utf8').split('\n')) {
+  forEachLineSync(filePath, (line) => {
     const value = line.trim()
     if (value) {
       values.add(value)
     }
-  }
+  })
   return values
 }
 
 /** Load keys from `key\\tdigest` lines (hash list resume files). */
 export const loadDoneKeys = (filePath) => {
   const done = new Set()
-  if (!fs.existsSync(filePath)) {
-    return done
-  }
-  for (const line of fs.readFileSync(filePath, 'utf8').split('\n')) {
+  forEachLineSync(filePath, (line) => {
     if (!line) {
-      continue
+      return
     }
-    const [key, digest] = line.split('\t')
+    const tab = line.indexOf('\t')
+    if (tab <= 0) {
+      return
+    }
+    const key = line.slice(0, tab)
+    const digest = line.slice(tab + 1)
     if (key && digest) {
       done.add(key)
     }
-  }
+  })
   return done
 }
 
