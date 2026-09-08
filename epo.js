@@ -300,7 +300,7 @@ const extractArchive = async (archivePath, workDir) => {
   throw new Error(`unsupported archive type: ${archivePath}`)
 }
 
-/** Unzip nested .zip files in place until none remain. */
+/** Unzip nested .zip files in place until none remain. Skip corrupt zips. */
 const expandNestedZips = async (workDir) => {
   for (;;) {
     const zips = []
@@ -315,7 +315,12 @@ const expandNestedZips = async (workDir) => {
     console.log('expanding nested zips:', zips.length)
     for (const zipPath of zips) {
       const destDir = zipPath.replace(/\.zip$/i, '')
-      await extractZip(zipPath, destDir)
+      try {
+        await extractZip(zipPath, destDir)
+      } catch (e) {
+        // EPO packages sometimes include truncated per-doc zips; don't fail the archive.
+        console.warn('skipping corrupt nested zip:', zipPath, e.message)
+      }
       await removePath(zipPath)
     }
   }
