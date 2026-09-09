@@ -15,24 +15,41 @@ export const partitionByPrefix = (hashes, prefixLength) => {
   return result
 }
 
-export const savePartitions = async (dir, partitionMap) => {
-  const detaches = []
+/** List partition data filenames in `dir` (hex prefixes, excluding .ots). */
+export const listPartitionFiles = (dir) =>
+  fs.readdirSync(dir)
+    .filter((name) => /^[0-9A-Fa-f]+$/.test(name))
+    .sort()
+
+/**
+ * SHA-256 each partition file in `dir`, calendar-stamp, and write `<prefix>.ots`.
+ * Partition data files must already exist on disk.
+ */
+export const stampPartitionDir = async (dir) => {
+  const prefixes = listPartitionFiles(dir)
   const opObject = new OpenTimestamps.Ops.OpSHA256()
+  const detaches = []
+  for (const prefix of prefixes) {
+    const data = fs.readFileSync(path.join(dir, prefix))
+    const digest = createHash('sha256').update(data).digest()
+    detaches.push(OpenTimestamps.DetachedTimestampFile.fromHash(opObject, digest))
+  }
+  await OpenTimestamps.stamp(detaches)
+  for (let i = 0; i < prefixes.length; ++i) {
+    fs.writeFileSync(
+      path.join(dir, `${prefixes[i]}.ots`),
+      Buffer.from(detaches[i].serializeToBytes())
+    )
+  }
+  return prefixes.length
+}
+
+export const savePartitions = async (dir, partitionMap) => {
   for (const [prefix, items] of Object.entries(partitionMap)) {
     const data = Buffer.from(items.join(''), 'hex')
     fs.writeFileSync(path.join(dir, prefix), data)
-    const hash = createHash('sha256')
-    hash.update(data)
-    const digest = hash.digest()
-    const detach = OpenTimestamps.DetachedTimestampFile.fromHash(opObject, digest)
-    detaches.push(detach)
   }
-  await OpenTimestamps.stamp(detaches)
-  const detachesSerialized = detaches.map(d => d.serializeToBytes())
-  const prefixes = Object.keys(partitionMap)
-  for (let i = 0; i < detachesSerialized.length; ++i) {
-    fs.writeFileSync(path.join(dir, `${prefixes[i]}.ots`), detachesSerialized[i])
-  }
+  await stampPartitionDir(dir)
 }
 
 export const makePartitions = async (dir, hashes, prefixLength) => {

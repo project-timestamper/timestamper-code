@@ -1,92 +1,77 @@
 import fs from 'node:fs'
 import path from 'node:path'
+import readline from 'node:readline'
 import minimist from 'minimist'
 import esMain from 'es-main'
-import { readColumn } from './column.js'
-import { makePartitions } from './partition.js'
+import { stampPartitionDir } from './partition.js'
 
 /**
- * Extract column `n` from a TSV hash list, partition by hex prefix length `s`,
- * and write OpenTimestamps partitions under ../timestamper/docs/<collection>.
+ * Stream TSV column `n` into ../timestamper/docs/<name>, partitioned by hex
+ * prefix length `s`, then stamp. Avoids loading the full hash list in memory.
  *
- * Usage:
- *   node partition-column.js <input.tsv> --column 1 --prefix 3 --name annas_archive_torrents
- *   node partition-column.js annas_archive_torrent_hashes.txt -n 1 -s 3 -c annas_archive_torrents
+ *   node partition-column.js hashes.txt -n 2 -s 4 -c annas_literature_hashes
  */
 
 const DOCS_ROOT = path.resolve('../timestamper/docs')
-const HEX_RE = /^[0-9a-f]+$/i
+const FLUSH_BYTES = 32 * 1024 * 1024
 
-const usage = () => {
-  console.error(`Usage: node partition-column.js <input.tsv> --column <n> --prefix <s> --name <collection>
-
-  --column, -n   0-based TSV column containing hashes (e.g. 1 for url\\thash)
-  --prefix, -s   hex prefix length for partition filenames
-  --name, -c     collection directory name under ${DOCS_ROOT}
-`)
-}
-
-const run = async (argv = process.argv.slice(2)) => {
-  const args = minimist(argv, {
-    string: ['name'],
-    boolean: ['help'],
-    alias: {
-      n: 'column',
-      s: 'prefix',
-      c: 'name',
-      h: 'help'
-    }
+const run = async () => {
+  const args = minimist(process.argv.slice(2), {
+    alias: { n: 'column', s: 'prefix', c: 'name' }
   })
+  const [inputPath] = args._
+  const column = Number(args.column)
+  const prefixLength = Number(args.prefix)
+  const outDir = path.join(DOCS_ROOT, String(args.name))
 
-  if (args.help || args._.length !== 1 ||
-      args.column === undefined || args.prefix === undefined || !args.name) {
-    usage()
+  if (!inputPath || !Number.isInteger(column) || !Number.isInteger(prefixLength) || !args.name) {
+    console.error('Usage: node partition-column.js <file> -n <column> -s <prefix> -c <name>')
     process.exitCode = 1
     return
   }
 
-  const inputPath = args._[0]
-  const column = Number(args.column)
-  const prefixLength = Number(args.prefix)
-  const collection = String(args.name)
-
-  if (!Number.isInteger(column) || column < 0) {
-    throw new Error(`invalid --column: ${args.column}`)
-  }
-  if (!Number.isInteger(prefixLength) || prefixLength < 1) {
-    throw new Error(`invalid --prefix: ${args.prefix}`)
-  }
-  if (!collection || collection.includes('/') || collection.includes('..')) {
-    throw new Error(`invalid --name: ${args.name}`)
-  }
-  if (!fs.existsSync(inputPath)) {
-    throw new Error(`input not found: ${inputPath}`)
-  }
-
-  const outDir = path.join(DOCS_ROOT, collection)
-  console.log('reading column', column, 'from', inputPath)
-  const raw = await readColumn(inputPath, column)
-
-  const hashes = []
-  let skipped = 0
-  for (const value of raw) {
-    const hash = String(value).trim().toLowerCase()
-    if (!hash || !HEX_RE.test(hash)) {
-      skipped++
-      continue
-    }
-    if (hash.length < prefixLength) {
-      skipped++
-      continue
-    }
-    hashes.push(hash)
-  }
-
-  console.log(`hashes ${hashes.length} (skipped ${skipped})`)
-  console.log('writing partitions to', outDir, `prefix=${prefixLength}`)
   fs.mkdirSync(outDir, { recursive: true })
-  await makePartitions(outDir, hashes, prefixLength)
-  console.log('done')
+  for (const name of fs.readdirSync(outDir)) {
+    if (new RegExp(`^[0-9A-Fa-f]{${prefixLength}}(\\.ots)?$`).test(name)) {
+      fs.unlinkSync(path.join(outDir, name))
+    }
+  }
+
+  const pending = new Map() // prefix -> Buffer[]
+  let pendingBytes = 0
+  let kept = 0
+
+  const flush = () => {
+    for (const [prefix, chunks] of pending) {
+      fs.appendFileSync(path.join(outDir, prefix), Buffer.concat(chunks))
+    }
+    pending.clear()
+    pendingBytes = 0
+  }
+
+  const rl = readline.createInterface({
+    input: fs.createReadStream(inputPath),
+    crlfDelay: Infinity
+  })
+
+  for await (const line of rl) {
+    const hash = line.split('\t')[column]?.trim().toLowerCase()
+    if (!hash || hash.length < prefixLength || hash.length % 2 || /[^0-9a-f]/.test(hash)) {
+      continue
+    }
+    const prefix = hash.slice(0, prefixLength).toUpperCase()
+    const bytes = Buffer.from(hash, 'hex')
+    if (!pending.has(prefix)) pending.set(prefix, [])
+    pending.get(prefix).push(bytes)
+    pendingBytes += bytes.length
+    kept++
+    if (pendingBytes >= FLUSH_BYTES) flush()
+    if (kept % 1_000_000 === 0) console.log('kept', kept)
+  }
+  flush()
+
+  console.log('wrote', kept, 'hashes; stamping…')
+  console.log('stamped', await stampPartitionDir(outDir))
 }
 
 if (esMain(import.meta)) {
@@ -95,5 +80,3 @@ if (esMain(import.meta)) {
     process.exitCode = 1
   })
 }
-
-export { run }
