@@ -89,8 +89,11 @@ const Calendar = OpenTimestamps.Calendar
 /**
  * Upgrade a timestamp tree using a commitment cache (Python otsclient style).
  * Shared calendar tips are fetched once, then reused for later .ots files.
+ *
+ * `pendingTried` is an optional Set of `${uri}\\t${commitmentHex}` keys already
+ * contacted this run (avoids re-polling a still-pending calendar for every file).
  */
-export const upgradeTimestampCached = async (timestamp, cache) => {
+export const upgradeTimestampCached = async (timestamp, cache, pendingTried = new Set()) => {
   let changed = false
   const attestationsBefore = timestamp.getAttestations().size
 
@@ -103,14 +106,17 @@ export const upgradeTimestampCached = async (timestamp, cache) => {
     console.log('Got attestation(s) from cache')
   }
 
+  // One Bitcoin attestation anywhere in the tree is enough (same as Python ots).
+  // Do not keep polling sibling calendars (e.g. finney) that are still pending.
+  if (timestamp.isTimestampComplete()) {
+    return changed
+  }
+
   const whitelist = Calendar.DEFAULT_CALENDAR_WHITELIST
   const existingAttestations = timestamp.getAttestations()
   const jobs = []
 
-  // Collect calendar requests up front (like the library) so one completing
-  // attestation does not skip the other calendars for this tip.
   for (const subStamp of timestamp.directlyVerified()) {
-    if (subStamp.isTimestampComplete()) continue
     for (const attestation of subStamp.attestations) {
       if (!(attestation instanceof Notary.PendingAttestation)) continue
       if (!whitelist.contains(attestation.uri)) {
@@ -120,12 +126,21 @@ export const upgradeTimestampCached = async (timestamp, cache) => {
         )
         continue
       }
-      jobs.push({ subStamp, uri: attestation.uri, commitment: subStamp.msg })
+      const commitmentHex = OpenTimestamps.Utils.bytesToHex(subStamp.msg)
+      const triedKey = `${attestation.uri}\t${commitmentHex}`
+      if (pendingTried.has(triedKey)) continue
+      jobs.push({
+        subStamp,
+        uri: attestation.uri,
+        commitment: subStamp.msg,
+        triedKey
+      })
     }
   }
 
-  await Promise.all(jobs.map(async ({ subStamp, uri, commitment }) => {
+  await Promise.all(jobs.map(async ({ subStamp, uri, commitment, triedKey }) => {
     const calendar = new Calendar.RemoteCalendar(uri)
+    pendingTried.add(triedKey)
     try {
       const upgradedStamp = await calendar.getTimestamp(commitment)
       const attsFromRemote = upgradedStamp.getAttestations()
@@ -146,15 +161,20 @@ export const upgradeTimestampCached = async (timestamp, cache) => {
   return changed
 }
 
-export const upgrade = async (filePath, cache = new TimestampCache()) => {
+export const upgrade = async (
+  filePath,
+  cache = new TimestampCache(),
+  pendingTried = new Set()
+) => {
   const buf = await fs.promises.readFile(filePath)
   const detachedOts = DetachedTimestampFile.deserialize(buf)
-  await upgradeTimestampCached(detachedOts.timestamp, cache)
+  await upgradeTimestampCached(detachedOts.timestamp, cache, pendingTried)
   await fs.promises.writeFile(filePath, Buffer.from(detachedOts.serializeToBytes(), 'binary'))
 }
 
 export const upgradeAll = async (dir, cachePath) => {
   const cache = new TimestampCache(cachePath)
+  const pendingTried = new Set()
   const files = (await fs.promises.readdir(dir)).filter(f => f.endsWith('.ots')).sort()
   let i = 0
   for (const file of files) {
@@ -162,7 +182,7 @@ export const upgradeAll = async (dir, cachePath) => {
     if (i <= 5 || i % 100 === 0 || i === files.length) {
       console.log(`[${i}/${files.length}]`, file)
     }
-    await upgrade(path.join(dir, file), cache)
+    await upgrade(path.join(dir, file), cache, pendingTried)
   }
 }
 
