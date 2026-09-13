@@ -205,6 +205,9 @@ const processShard = async (shardPath, tmpPath, onProgress) => {
   const url = DATA_BASE + shardPath
   const response = await withRetries(url, () => fetchOnce(url))
   const { stdout, proc } = gzipDecodeStream(response.body)
+  // Attach before reading — gzip may emit 'close' before we finish
+  // draining/writing, and a late once('close') would hang forever.
+  const closed = once(proc, 'close')
   const rl = readline.createInterface({ input: stdout, crlfDelay: Infinity })
   const out = fs.createWriteStream(tmpPath)
 
@@ -226,7 +229,7 @@ const processShard = async (shardPath, tmpPath, onProgress) => {
     }
     out.end()
     await once(out, 'finish')
-    const [exit] = await once(proc, 'close')
+    const [exit] = await closed
     if (exit !== 0 && exit !== null) {
       throw new Error(`gzip -cd exited ${exit} for ${shardPath}`)
     }
