@@ -67,6 +67,23 @@ export const moveToUpperCase = async (dir) => {
 
 export const sleep = (ms) => new Promise((resolve) => setTimeout(resolve, ms))
 
+export const USER_AGENT = 'timestamper/0.0.1 (https://github.com/arthuredelstein/timestamper)'
+
+/** fetch with project User-Agent; throws on non-OK or missing body. */
+export const fetchOnce = async (url, { headers = {}, ...init } = {}) => {
+  const response = await fetch(url, {
+    ...init,
+    headers: { 'User-Agent': USER_AGENT, ...headers }
+  })
+  if (!response.ok) {
+    throw new Error(`status: ${response.status} ${url}`)
+  }
+  if (!response.body) {
+    throw new Error(`no body: ${url}`)
+  }
+  return response
+}
+
 export const sidecarPath = (outputPath, suffix) => {
   if (outputPath.endsWith('_hashes.txt')) {
     return outputPath.replace(/_hashes\.txt$/, `_${suffix}`)

@@ -44,11 +44,15 @@ export const stampPartitionDir = async (dir) => {
   return prefixes.length
 }
 
-export const savePartitions = async (dir, partitionMap) => {
+export const writePartitions = (dir, partitionMap) => {
   for (const [prefix, items] of Object.entries(partitionMap)) {
     const data = Buffer.from(items.join(''), 'hex')
     fs.writeFileSync(path.join(dir, prefix), data)
   }
+}
+
+export const savePartitions = async (dir, partitionMap) => {
+  writePartitions(dir, partitionMap)
   await stampPartitionDir(dir)
 }
 
