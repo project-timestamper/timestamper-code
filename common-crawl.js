@@ -61,10 +61,12 @@ const extractDigest = (line) => {
   if (!line) {
     return null
   }
-  const jsonStart = line.indexOf('{')
-  if (jsonStart !== -1) {
+  // CDXJ: urlkey timestamp {json…} — locate JSON after timestamp so a
+  // literal '{' in the urlkey does not break parsing.
+  const cdxj = line.match(/^\S+\s+\d{14}\s+(\{.*\})\s*$/)
+  if (cdxj) {
     try {
-      const obj = JSON.parse(line.slice(jsonStart))
+      const obj = JSON.parse(cdxj[1])
       return digestToHex(obj.digest)
     } catch {
       return null
