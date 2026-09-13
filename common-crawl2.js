@@ -6,7 +6,6 @@ import { Readable } from 'node:stream'
 import { pipeline } from 'node:stream/promises'
 import minimist from 'minimist'
 import esMain from 'es-main'
-import { partitionByPrefix, writePartitions } from './partition.js'
 import {
   appendLine,
   fetchOnce,
@@ -17,13 +16,16 @@ import {
 
 /**
  * Hash Common Crawl ZipNum CDX blocks (SHA-256 of each compressed gzip
- * member) into partitioned binary hashlists via partition.js:
+ * member) into one binary hashlist per shard:
  *
- *   ../timestamper/common_crawl_blocks/<CRAWL>/<PREFIX>     # PREFIX = first 3 hex digits, uppercase
- *   ../timestamper/common_crawl_blocks/completed_crawls.txt # crawls finished successfully (--all skips these)
+ *   ../timestamper/docs/common_crawl_blocks/<CRAWL>/cdx-NNNNN
+ *   ../timestamper/docs/common_crawl_blocks/completed_crawls.txt
+ *
+ * Shard files are named from cluster.idx `part` with `.gz` stripped
+ * (e.g. cdx-00066.gz → cdx-00066). Verify uses showPagedIndex `part`.
  *
  * Each crawl directory is cleared at start (no mid-crawl resume). Each shard
- * is downloaded to disk, hashed by cluster.idx ranges, then deleted.
+ * is downloaded to disk, hashed by cluster.idx ranges, written, then deleted.
  *
  *   node common-crawl2.js --crawl CC-MAIN-2026-34
  *   node common-crawl2.js --all
@@ -33,8 +35,11 @@ import {
 const DATA_BASE = 'https://data.commoncrawl.org/'
 const COLLINFO_URL = 'https://index.commoncrawl.org/collinfo.json'
 const DEFAULT_OUT = path.resolve('../timestamper/docs/common_crawl_blocks')
-const PREFIX_LEN = 3
 const COMPLETED_CRAWLS_FILE = 'completed_crawls.txt'
+
+/** Map CDX `part` (e.g. cdx-00066.gz) to on-disk hashlist name. */
+const shardHashlistName = (part) =>
+  part.endsWith('.gz') ? part.slice(0, -3) : part
 
 const listCrawls = async () => {
   const response = await withRetries(COLLINFO_URL, () => fetchOnce(COLLINFO_URL))
@@ -81,6 +86,7 @@ const resetCrawlDir = (dir) => {
 
 const downloadShard = async (url, destPath) => {
   await withRetries(url, async () => {
+    fs.mkdirSync(path.dirname(destPath), { recursive: true })
     const response = await fetchOnce(url)
     const expected = Number(response.headers.get('content-length'))
     const out = fs.createWriteStream(destPath)
@@ -99,6 +105,7 @@ const downloadShard = async (url, destPath) => {
   })
 }
 
+/** @returns {Buffer[]} SHA-256 digests (32 bytes each), block order */
 const hashBlocksFromFile = (filePath, blocks) => {
   if (blocks.length === 0) return []
   if (blocks[0].offset !== 0) {
@@ -126,12 +133,18 @@ const hashBlocksFromFile = (filePath, blocks) => {
       if (read !== length) {
         throw new Error(`short read at ${offset}: got ${read}, want ${length}`)
       }
-      hashes.push(createHash('sha256').update(buf).digest('hex'))
+      hashes.push(createHash('sha256').update(buf).digest())
     }
   } finally {
     fs.closeSync(fd)
   }
   return hashes
+}
+
+const writeShardHashlist = (outDir, part, digests) => {
+  const name = shardHashlistName(part)
+  fs.writeFileSync(path.join(outDir, name), Buffer.concat(digests))
+  return name
 }
 
 const processShard = async (crawl, part, blocks, outDir) => {
@@ -143,7 +156,10 @@ const processShard = async (crawl, part, blocks, outDir) => {
   await downloadShard(url, tmpPath)
   try {
     console.log('  hashing', blocks.length, 'blocks')
-    return hashBlocksFromFile(tmpPath, blocks)
+    const digests = hashBlocksFromFile(tmpPath, blocks)
+    const name = writeShardHashlist(outDir, part, digests)
+    console.log('  wrote', name)
+    return digests.length
   } finally {
     if (fs.existsSync(tmpPath)) fs.unlinkSync(tmpPath)
   }
@@ -152,7 +168,6 @@ const processShard = async (crawl, part, blocks, outDir) => {
 export const collectCrawlBlockHashes = async ({
   crawl,
   outRoot = DEFAULT_OUT,
-  prefixLen = PREFIX_LEN,
   limit = Infinity
 } = {}) => {
   const outDir = path.join(outRoot, crawl)
@@ -168,21 +183,21 @@ export const collectCrawlBlockHashes = async ({
   console.log('shards:', parts.length, 'selected:', selected.length)
 
   const startMs = Date.now()
-  const allHashes = []
+  let blocksHashed = 0
 
   for (let i = 0; i < selected.length; i++) {
     const part = selected[i]
     const blocks = byPart.get(part)
     console.log('shard', part, `(${blocks.length} blocks) [${i + 1}/${selected.length}]`)
     try {
-      const hashes = await processShard(crawl, part, blocks, outDir)
-      allHashes.push(...hashes)
+      const n = await processShard(crawl, part, blocks, outDir)
+      blocksHashed += n
       const elapsed = Date.now() - startMs
       const done = i + 1
       const eta = done > 0 ? (selected.length - done) * (elapsed / done) : 0
       console.log(
-        `done ${part} blocks=${hashes.length} ` +
-        `progress: ${allHashes.length} hashed, ${done}/${selected.length} shards, ` +
+        `done ${part} blocks=${n} ` +
+        `progress: ${blocksHashed} hashed, ${done}/${selected.length} shards, ` +
         `elapsed ${formatDuration(elapsed)}, eta ${formatDuration(eta)}`
       )
     } catch (e) {
@@ -191,13 +206,10 @@ export const collectCrawlBlockHashes = async ({
     }
   }
 
-  console.log('writing partitions with partition.js…')
-  writePartitions(outDir, partitionByPrefix(allHashes, prefixLen))
-  console.log('partitioned', allHashes.length, 'hashes into prefix-', prefixLen, 'files')
-
   return {
     crawl,
-    blocksHashed: allHashes.length,
+    blocksHashed,
+    shardsWritten: selected.length,
     outDir,
     complete: !Number.isFinite(limit) || limit >= parts.length
   }
@@ -206,17 +218,10 @@ export const collectCrawlBlockHashes = async ({
 const main = async () => {
   const args = minimist(process.argv.slice(2), {
     boolean: ['all'],
-    default: { out: DEFAULT_OUT, prefix: PREFIX_LEN },
-    alias: { c: 'crawl', o: 'out', s: 'prefix', n: 'limit' },
+    default: { out: DEFAULT_OUT },
+    alias: { c: 'crawl', o: 'out', n: 'limit' },
     string: ['crawl', 'out']
   })
-
-  const prefixLen = Number(args.prefix)
-  if (!Number.isInteger(prefixLen) || prefixLen < 1) {
-    console.error('invalid --prefix')
-    process.exitCode = 1
-    return
-  }
 
   const outRoot = args.out
   fs.mkdirSync(outRoot, { recursive: true })
@@ -244,10 +249,13 @@ const main = async () => {
       const result = await collectCrawlBlockHashes({
         crawl,
         outRoot,
-        prefixLen,
         limit
       })
-      console.log('finished', result.crawl, 'blocks hashed:', result.blocksHashed)
+      console.log(
+        'finished', result.crawl,
+        'blocks hashed:', result.blocksHashed,
+        'shards:', result.shardsWritten
+      )
       if (result.complete && !completedCrawls.has(crawl)) {
         appendLine(completedPath, crawl)
         completedCrawls.add(crawl)
