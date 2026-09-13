@@ -32,7 +32,7 @@ import {
 
 const DATA_BASE = 'https://data.commoncrawl.org/'
 const COLLINFO_URL = 'https://index.commoncrawl.org/collinfo.json'
-const DEFAULT_OUT = path.resolve('../timestamper/common_crawl_blocks')
+const DEFAULT_OUT = path.resolve('../timestamper/docs/common_crawl_blocks')
 const PREFIX_LEN = 3
 const COMPLETED_CRAWLS_FILE = 'completed_crawls.txt'
 
