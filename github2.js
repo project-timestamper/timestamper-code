@@ -184,10 +184,24 @@ const asOfDSha = async (token, owner, name, until) => {
   const url = new URL(`https://api.github.com/repos/${owner}/${name}/commits`)
   url.searchParams.set('until', until)
   url.searchParams.set('per_page', '1')
-  const { json, skip, rateLimit } = await githubGet(token, url, { skipStatuses: [404, 409] })
-  await paceCore(rateLimit)
-  if (skip || !Array.isArray(json) || !json[0]?.sha) return null
-  return String(json[0].sha).toLowerCase()
+  try {
+    const { json, skip, status, rateLimit } = await githubGet(token, url, {
+      skipStatuses: [404, 409, 422]
+    })
+    await paceCore(rateLimit)
+    if (skip) {
+      if (status === 422) console.log('skip', `${owner}/${name}`, 'status', status)
+      return null
+    }
+    if (!Array.isArray(json) || !json[0]?.sha) return null
+    return String(json[0].sha).toLowerCase()
+  } catch (err) {
+    if (/^github (?:403|429)\b/.test(err.message) || /status: (?:401|403)\b/.test(err.message)) {
+      throw err
+    }
+    console.error('skip sha', `${owner}/${name}`, err.message)
+    return null
+  }
 }
 
 const run = async (argv = process.argv.slice(2)) => {
