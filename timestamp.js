@@ -103,7 +103,6 @@ export const upgradeTimestampCached = async (timestamp, cache, pendingTried = ne
   }
   if (timestamp.getAttestations().size > attestationsBefore) {
     changed = true
-    console.log('Got attestation(s) from cache')
   }
 
   // One Bitcoin attestation anywhere in the tree is enough (same as Python ots).
@@ -172,17 +171,30 @@ export const upgrade = async (
   await fs.promises.writeFile(filePath, Buffer.from(detachedOts.serializeToBytes(), 'binary'))
 }
 
+const listOtsFiles = async (dir) => {
+  const out = []
+  const walk = async (d) => {
+    for (const entry of await fs.promises.readdir(d, { withFileTypes: true })) {
+      const p = path.join(d, entry.name)
+      if (entry.isDirectory()) await walk(p)
+      else if (entry.name.endsWith('.ots')) out.push(p)
+    }
+  }
+  await walk(dir)
+  return out.sort()
+}
+
 export const upgradeAll = async (dir, cachePath) => {
   const cache = new TimestampCache(cachePath)
   const pendingTried = new Set()
-  const files = (await fs.promises.readdir(dir)).filter(f => f.endsWith('.ots')).sort()
+  const files = await listOtsFiles(dir)
   let i = 0
-  for (const file of files) {
+  for (const filePath of files) {
     i++
     if (i <= 5 || i % 100 === 0 || i === files.length) {
-      console.log(`[${i}/${files.length}]`, file)
+      console.log(`[${i}/${files.length}]`, path.relative(dir, filePath))
     }
-    await upgrade(path.join(dir, file), cache, pendingTried)
+    await upgrade(filePath, cache, pendingTried)
   }
 }
 
