@@ -40,9 +40,11 @@ import {
  * `--limit` is how many .meca packages to process this run.
  *
  * Logs the cumulative number of .meca files complete every 10,000, and
- * again at the end. A download that still fails stops the run and leaves
- * the cursor put. A package that downloads but is not a readable zip is
- * not counted complete, and the cursor moves past it.
+ * again at the end. Once an hour it also logs elapsed time and the
+ * estimated duration of this run, as done / total. A download that still
+ * fails stops the run and leaves the cursor put. A package that downloads
+ * but is not a readable zip is not counted complete, and the cursor moves
+ * past it.
  *
  * Uses the AWS SDK default credential chain. Run on an EC2 instance in
  * us-east-1 so the download stays in-region.
@@ -57,6 +59,7 @@ const REGION = 'us-east-1'
 const DEFAULT_OUTPUT = 'biorxiv_hashes.txt'
 const PAGE_SIZE = 1000
 const LOG_EVERY = 10000
+const HOUR_MS = 60 * 60 * 1000
 const FETCH_RETRIES = 5
 const RETRY_DELAY_MS = 10000
 const XML_SNIFF_BYTES = 2 * 1024 * 1024
@@ -235,9 +238,28 @@ const writeResume = (resumePath, count, bucket, key) => {
   fs.writeFileSync(resumePath, `${count}\t${bucket}\t${key}\n`)
 }
 
-const logComplete = (completed, bucket, key, started) => {
+const formatLongDuration = (ms) => {
+  const totalSec = Math.max(0, Math.round(ms / 1000))
+  const d = Math.floor(totalSec / 86400)
+  if (d === 0) return formatDuration(ms)
+  const h = Math.floor((totalSec % 86400) / 3600)
+  const m = Math.floor((totalSec % 3600) / 60)
+  return `${d}d ${h}h ${m}m`
+}
+
+const countMecas = async (client) => {
+  let total = 0
+  for (const bucket of BUCKETS) {
+    for await (const key of listKeys(client, bucket)) {
+      if (key.toLowerCase().endsWith('.meca')) total++
+    }
+  }
+  return total
+}
+
+const logComplete = (completed, total, bucket, key, started) => {
   console.log(
-    `meca files complete: ${completed}, ` +
+    `meca files complete: ${completed} / ${total}, ` +
     `elapsed ${formatDuration(Date.now() - started)}, ` +
     `last ${bucket}/${key}`
   )
@@ -260,60 +282,87 @@ export const collectBiorxivHashes = async ({
 
   console.log('output:', outputPath)
   if (resume) console.log('resume after', `${resume.bucket}/${resume.key}`)
-  console.log(`meca files complete: ${completed}`)
+  console.log('counting meca files…')
+  const total = await countMecas(s3)
+  const completedAtStart = completed
+  const goal = limit === Infinity ? total : Math.min(total, completedAtStart + limit)
+  console.log(`meca files complete: ${completed} / ${total}`)
+
+  const logHourly = () => {
+    const elapsed = Date.now() - started
+    const doneThisRun = completed - completedAtStart
+    let estimated = 'unknown'
+    if (doneThisRun > 0 && completed < goal) {
+      estimated = formatLongDuration(elapsed * (goal - completedAtStart) / doneThisRun)
+    } else if (completed >= goal && goal > completedAtStart) {
+      estimated = formatLongDuration(elapsed)
+    }
+    console.log(
+      `meca files complete: ${completed} / ${total}, ` +
+      `elapsed ${formatLongDuration(elapsed)}, ` +
+      `estimated total ${estimated}`
+    )
+  }
+  const timer = setInterval(logHourly, HOUR_MS)
+  timer.unref()
 
   let stop = false
-  for (let i = startIndex; i < BUCKETS.length && !stop; i++) {
-    const bucket = BUCKETS[i]
-    const startAfter = resume && bucket === resume.bucket ? resume.key : undefined
-    for await (const key of listKeys(s3, bucket, startAfter)) {
-      if (startAfter && key <= startAfter) continue
-      if (!key.toLowerCase().endsWith('.meca')) continue
-      if (processed >= limit) {
-        stop = true
-        break
-      }
-      processed++
+  try {
+    for (let i = startIndex; i < BUCKETS.length && !stop; i++) {
+      const bucket = BUCKETS[i]
+      const startAfter = resume && bucket === resume.bucket ? resume.key : undefined
+      for await (const key of listKeys(s3, bucket, startAfter)) {
+        if (startAfter && key <= startAfter) continue
+        if (!key.toLowerCase().endsWith('.meca')) continue
+        if (processed >= limit) {
+          stop = true
+          break
+        }
+        processed++
 
-      const dest = path.join(
-        os.tmpdir(),
-        `biorxiv-${process.pid}-${randomBytes(8).toString('hex')}.meca`
-      )
-      const fallbackId = `s3://${bucket}/${key}`
-      let downloaded = false
-      let outcome = null
-      try {
-        await withRetries(fallbackId, () => downloadTo(s3, bucket, key, dest), {
-          retries: FETCH_RETRIES,
-          delayMs: RETRY_DELAY_MS
-        })
-        downloaded = true
-        outcome = await rowsForMeca(dest, fallbackId)
-      } catch (err) {
-        if (!downloaded) throw err
-        failed++
-        console.error(`failed ${fallbackId}: ${err.message}`)
+        const dest = path.join(
+          os.tmpdir(),
+          `biorxiv-${process.pid}-${randomBytes(8).toString('hex')}.meca`
+        )
+        const fallbackId = `s3://${bucket}/${key}`
+        let downloaded = false
+        let outcome = null
+        try {
+          await withRetries(fallbackId, () => downloadTo(s3, bucket, key, dest), {
+            retries: FETCH_RETRIES,
+            delayMs: RETRY_DELAY_MS
+          })
+          downloaded = true
+          outcome = await rowsForMeca(dest, fallbackId)
+        } catch (err) {
+          if (!downloaded) throw err
+          failed++
+          console.error(`failed ${fallbackId}: ${err.message}`)
+          writeResume(resumePath, completed, bucket, key)
+          continue
+        } finally {
+          await fs.promises.rm(dest, { force: true })
+        }
+
+        for (const row of outcome.rows) {
+          appendHash(outputPath, row.id, row.digest)
+        }
+        hashes += outcome.rows.length
+        if (outcome.unparsed) unparsed++
+        completed++
         writeResume(resumePath, completed, bucket, key)
-        continue
-      } finally {
-        await fs.promises.rm(dest, { force: true })
-      }
-
-      for (const row of outcome.rows) {
-        appendHash(outputPath, row.id, row.digest)
-      }
-      hashes += outcome.rows.length
-      if (outcome.unparsed) unparsed++
-      completed++
-      writeResume(resumePath, completed, bucket, key)
-      if (completed % LOG_EVERY === 0) {
-        logComplete(completed, bucket, key, started)
+        if (completed % LOG_EVERY === 0) {
+          logComplete(completed, total, bucket, key, started)
+        }
       }
     }
+  } finally {
+    clearInterval(timer)
   }
 
   return {
     completed,
+    total,
     written: completed - (resume ? resume.count : 0),
     hashes,
     failed,
@@ -333,12 +382,12 @@ const main = async () => {
   }
 
   const started = Date.now()
-  const { completed, written, hashes, failed, unparsed } = await collectBiorxivHashes({
+  const { completed, total, written, hashes, failed, unparsed } = await collectBiorxivHashes({
     outputPath: args.output,
     limit
   })
   console.log(
-    `done: ${written} meca files this run, ${completed} meca files complete, ` +
+    `done: ${written} meca files this run, ${completed} / ${total} meca files complete, ` +
     `${hashes} hashes written, ${failed} failed, ` +
     `elapsed ${formatDuration(Date.now() - started)}`
   )
