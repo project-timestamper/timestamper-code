@@ -156,9 +156,13 @@ export const collectWaybackCdxHashes = async ({
   console.log('output:', outputPath)
   console.log('query: mediatype:web')
   console.log('page size:', pageSize, 'concurrency:', concurrency)
-  if (state.done) {
+  if (state.done && state.itemsDone >= state.total) {
     console.log('already complete:', state.itemsDone, 'items,', state.hashesWritten, 'hashes')
     return { itemsDone: state.itemsDone, hashesWritten: state.hashesWritten, complete: true }
+  }
+  if (state.done) {
+    state.done = false
+    saveResume(resumePath, state)
   }
   if (state.after) console.log('resume after', state.after)
   if (state.total) console.log('total items:', state.total)
@@ -189,6 +193,10 @@ export const collectWaybackCdxHashes = async ({
       throw new Error(`search did not advance after ${state.after}`)
     }
     if (ids.length === 0) {
+      const remaining = state.total - state.itemsDone
+      if (remaining > 0) {
+        throw new Error(`search returned no identifiers after ${state.after || '(start)'}, ${remaining} items remaining`)
+      }
       state.done = true
       saveResume(resumePath, state)
       break
@@ -221,7 +229,7 @@ export const collectWaybackCdxHashes = async ({
 
     if (runItems >= limit) break
     logProgress(state, runItems, started)
-    if (ids.length < pageSize) {
+    if (state.total > 0 && state.itemsDone >= state.total) {
       state.done = true
       saveResume(resumePath, state)
       break
