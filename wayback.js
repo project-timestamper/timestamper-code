@@ -43,6 +43,15 @@ const SHA1_RE = /^[0-9a-f]{40}$/
 
 const escapeIdentifier = (id) => id.replace(/\\/g, '\\\\').replace(/"/g, '\\"')
 
+// Archive.org sorts identifiers case-insensitively. JavaScript does not,
+// so "ACC…" sorts before "acb…" here and after it in search results.
+const identifierFollows = (id, after) => {
+  const folded = id.toLowerCase()
+  const foldedAfter = after.toLowerCase()
+  if (folded !== foldedAfter) return folded > foldedAfter
+  return id !== after
+}
+
 const pageQuery = (after) => {
   if (!after) return 'mediatype:web'
   const id = escapeIdentifier(after)
@@ -188,7 +197,7 @@ export const collectWaybackCdxHashes = async ({
       saveResume(resumePath, state)
       console.log('total items:', state.total)
     }
-    const ids = page.ids.filter((id) => !state.after || id > state.after)
+    const ids = page.ids.filter((id) => !state.after || identifierFollows(id, state.after))
     if (page.ids.length > 0 && ids.length === 0) {
       throw new Error(`search did not advance after ${state.after}`)
     }
