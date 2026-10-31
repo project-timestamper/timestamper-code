@@ -292,7 +292,11 @@ export const collectWaybackCdxHashes = async ({
         const rows = await withRetries(id, () => metadataRows(id, stats), {
           retries: METADATA_RETRIES,
           delayMs: RETRY_DELAY_MS,
-          isNonRetryable: (e) => /status: (?:40[134]|410|451)\b/.test(e.message)
+          // bad metadata is a successful HTTP response with the wrong shape;
+          // retrying usually just stalls concurrency slots.
+          isNonRetryable: (e) =>
+            /bad metadata\b/.test(e.message) ||
+            /status: (?:40[134]|410|451)\b/.test(e.message)
         })
         return { id, rows }
       } catch (e) {
