@@ -60,6 +60,9 @@ const pageQuery = (after) => {
   return `mediatype:web AND identifier:["${id}" TO *] AND NOT identifier:"${id}"`
 }
 
+/** Recent latency samples for p50/p95 (ring buffer; avoids unbounded memory). */
+const LATENCY_WINDOW = 10000
+
 const createMetaStats = () => ({
   attempts: 0,
   httpOk: 0,
@@ -68,16 +71,29 @@ const createMetaStats = () => ({
   totalMs: 0,
   byStatus: Object.create(null),
   itemsOk: 0,
-  itemsFailed: 0
+  itemsFailed: 0,
+  latencies: [],
+  latencyIdx: 0
 })
 
 const bump = (map, key) => {
   map[key] = (map[key] || 0) + 1
 }
 
+const recordLatency = (stats, ms) => {
+  const buf = stats.latencies
+  if (buf.length < LATENCY_WINDOW) {
+    buf.push(ms)
+    return
+  }
+  buf[stats.latencyIdx] = ms
+  stats.latencyIdx = (stats.latencyIdx + 1) % LATENCY_WINDOW
+}
+
 const recordMetaAttempt = (stats, { ms, status, httpOk, kind }) => {
   stats.attempts++
   stats.totalMs += ms
+  recordLatency(stats, ms)
   if (status) bump(stats.byStatus, String(status))
   if (httpOk) stats.httpOk++
   else {
@@ -86,8 +102,18 @@ const recordMetaAttempt = (stats, { ms, status, httpOk, kind }) => {
   }
 }
 
+/** Nearest-rank percentile on a sorted ascending array. */
+const percentileMs = (sorted, p) => {
+  if (sorted.length === 0) return 0
+  const rank = Math.ceil((p / 100) * sorted.length) - 1
+  return sorted[Math.max(0, Math.min(sorted.length - 1, rank))]
+}
+
 const formatMetaStats = (stats) => {
   const avgMs = stats.attempts > 0 ? Math.round(stats.totalMs / stats.attempts) : 0
+  const sorted = stats.latencies.slice().sort((a, b) => a - b)
+  const p50 = percentileMs(sorted, 50)
+  const p95 = percentileMs(sorted, 95)
   const httpErrPct = stats.attempts > 0
     ? ((100 * stats.httpErrors) / stats.attempts).toFixed(1)
     : '0.0'
@@ -102,7 +128,7 @@ const formatMetaStats = (stats) => {
     .join(' ')
   return (
     `http err ${httpErrPct}% (${stats.httpErrors}/${stats.attempts}), ` +
-    `avg ${avgMs}ms, ` +
+    `avg ${avgMs}ms p50 ${p50}ms p95 ${p95}ms, ` +
     `item fail ${itemFailPct}% (${stats.itemsFailed}/${items || 0}), ` +
     `bad meta ${stats.badMetadata}` +
     (statuses ? `, statuses ${statuses}` : '')
