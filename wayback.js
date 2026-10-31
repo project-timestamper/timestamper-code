@@ -1,4 +1,5 @@
 import fs from 'node:fs'
+import http2 from 'node:http2'
 import minimist from 'minimist'
 import esMain from 'es-main'
 import { pMapIterable } from 'p-map'
@@ -18,8 +19,9 @@ import {
  * downloadable. Per-WARC *.os.cdx.gz files are omitted.
  *
  * Advanced search lists identifiers in order, --page-size at a time.
- * --concurrency metadata requests stay in flight. Hashes are written
- * in identifier order. Resume is the last identifier written.
+ * --concurrency metadata requests stay in flight on one HTTP/2
+ * connection, at most 8. Hashes are written in identifier order.
+ * Resume is the last identifier written.
  *
  * Output: identifier/filename \t sha1
  *
@@ -35,6 +37,7 @@ const METADATA = 'https://archive.org/metadata'
 const DEFAULT_OUTPUT = 'wayback_hashes.txt'
 const PAGE_SIZE = 1000
 const CONCURRENCY = 8
+const ORIGIN = 'https://archive.org'
 const SEARCH_RETRIES = 8
 const METADATA_RETRIES = 5
 const RETRY_DELAY_MS = 5000
@@ -58,18 +61,101 @@ const pageQuery = (after) => {
   return `mediatype:web AND identifier:["${id}" TO *] AND NOT identifier:"${id}"`
 }
 
-const fetchJson = async (url) => {
-  const response = await fetch(url, {
-    headers: { 'User-Agent': USER_AGENT, Accept: 'application/json' }
+let session = null
+let sessionPromise = null
+
+const closeSession = () => {
+  const current = session
+  session = null
+  sessionPromise = null
+  if (current && !current.closed && !current.destroyed) current.close()
+}
+
+const getSession = () => {
+  if (session && !session.closed && !session.destroyed) return Promise.resolve(session)
+  if (!sessionPromise) {
+    sessionPromise = new Promise((resolve, reject) => {
+      const next = http2.connect(ORIGIN)
+      const onError = (err) => {
+        sessionPromise = null
+        reject(err)
+      }
+      next.once('error', onError)
+      next.once('connect', () => {
+        next.off('error', onError)
+        next.on('error', () => {
+          if (session === next) session = null
+        })
+        next.on('close', () => {
+          if (session === next) session = null
+        })
+        session = next
+        sessionPromise = null
+        resolve(next)
+      })
+    })
+  }
+  return sessionPromise
+}
+
+const requestJson = (client, url) => new Promise((resolve, reject) => {
+  const target = new URL(url)
+  let req
+  try {
+    req = client.request({
+      ':method': 'GET',
+      ':path': `${target.pathname}${target.search}`,
+      'user-agent': USER_AGENT,
+      accept: 'application/json'
+    })
+  } catch (err) {
+    reject(err)
+    return
+  }
+  const chunks = []
+  let status = 0
+  let retryAfter = null
+  let settled = false
+  const fail = (err) => {
+    if (settled) return
+    settled = true
+    reject(err)
+  }
+  req.on('error', fail)
+  req.on('response', (headers) => {
+    status = Number(headers[':status'])
+    retryAfter = headers['retry-after']
   })
+  req.on('data', (chunk) => chunks.push(chunk))
+  req.on('end', () => {
+    if (settled) return
+    settled = true
+    resolve({ status, retryAfter, body: Buffer.concat(chunks) })
+  })
+  req.end()
+})
+
+const fetchJson = async (url) => {
+  const client = await getSession()
+  let response
+  try {
+    response = await requestJson(client, url)
+  } catch (err) {
+    if (client.closed || client.destroyed) {
+      if (session === client) session = null
+    }
+    throw err
+  }
   if (response.status === 429 || response.status === 503) {
     const err = new Error(`status: ${response.status} ${url}`)
-    const retryAfter = Number(response.headers.get('retry-after'))
+    const retryAfter = Number(response.retryAfter)
     if (Number.isFinite(retryAfter) && retryAfter > 0) err.retryAfterMs = retryAfter * 1000
     throw err
   }
-  if (!response.ok) throw new Error(`status: ${response.status} ${url}`)
-  return response.json()
+  if (response.status < 200 || response.status >= 300) {
+    throw new Error(`status: ${response.status} ${url}`)
+  }
+  return JSON.parse(response.body.toString('utf8'))
 }
 
 const searchPage = async (after, rows) => {
@@ -161,6 +247,7 @@ export const collectWaybackCdxHashes = async ({
   const resumePath = resumePathFor(outputPath)
   const skipPath = sidecarPath(outputPath, 'skipped.txt')
   const state = loadResume(resumePath)
+  concurrency = Math.min(concurrency, CONCURRENCY)
 
   console.log('output:', outputPath)
   console.log('query: mediatype:web')
@@ -178,77 +265,80 @@ export const collectWaybackCdxHashes = async ({
 
   const started = Date.now()
   let runItems = 0
-
-  const commit = (id, rows) => {
-    for (const row of rows) appendHash(outputPath, row.path, row.sha1)
-    state.hashesWritten += rows.length
-    state.after = id
-    state.itemsDone++
-    runItems++
-    saveResume(resumePath, state)
-    if (runItems % LOG_EVERY === 0) logProgress(state, runItems, started)
-  }
-
-  for (;;) {
-    if (runItems >= limit) break
-    const page = await searchPage(state.after, pageSize)
-    if (!state.after && !state.total) {
-      state.total = page.total
+  try {
+    const commit = (id, rows) => {
+      for (const row of rows) appendHash(outputPath, row.path, row.sha1)
+      state.hashesWritten += rows.length
+      state.after = id
+      state.itemsDone++
+      runItems++
       saveResume(resumePath, state)
-      console.log('total items:', state.total)
-    }
-    const ids = page.ids.filter((id) => !state.after || identifierFollows(id, state.after))
-    if (page.ids.length > 0 && ids.length === 0) {
-      throw new Error(`search did not advance after ${state.after}`)
-    }
-    if (ids.length === 0) {
-      const remaining = state.total - state.itemsDone
-      if (remaining > 0) {
-        throw new Error(`search returned no identifiers after ${state.after || '(start)'}, ${remaining} items remaining`)
-      }
-      state.done = true
-      saveResume(resumePath, state)
-      break
-    }
-    console.log(
-      `page: ${ids.length} identifiers`,
-      state.after ? `after ${state.after}` : 'from start'
-    )
-
-    const pending = ids.slice(0, limit - runItems)
-    const results = pMapIterable(pending, async (id) => {
-      try {
-        const rows = await withRetries(id, () => metadataRows(id), {
-          retries: METADATA_RETRIES,
-          delayMs: RETRY_DELAY_MS,
-          isNonRetryable: (e) => /status: (?:40[134]|410|451)\b/.test(e.message)
-        })
-        return { id, rows }
-      } catch (e) {
-        return { id, rows: [], error: e }
-      }
-    }, { concurrency, backpressure: Infinity })
-    for await (const result of results) {
-      if (result.error) {
-        console.error('failed', result.id, result.error.message)
-        appendLine(skipPath, `${result.id}\t${result.error.message.replace(/[\t\r\n]/g, ' ')}`)
-      }
-      commit(result.id, result.rows)
+      if (runItems % LOG_EVERY === 0) logProgress(state, runItems, started)
     }
 
-    if (runItems >= limit) break
-    logProgress(state, runItems, started)
-    if (state.total > 0 && state.itemsDone >= state.total) {
-      state.done = true
-      saveResume(resumePath, state)
-      break
-    }
-  }
+    for (;;) {
+      if (runItems >= limit) break
+      const page = await searchPage(state.after, pageSize)
+      if (!state.after && !state.total) {
+        state.total = page.total
+        saveResume(resumePath, state)
+        console.log('total items:', state.total)
+      }
+      const ids = page.ids.filter((id) => !state.after || identifierFollows(id, state.after))
+      if (page.ids.length > 0 && ids.length === 0) {
+        throw new Error(`search did not advance after ${state.after}`)
+      }
+      if (ids.length === 0) {
+        const remaining = state.total - state.itemsDone
+        if (remaining > 0) {
+          throw new Error(`search returned no identifiers after ${state.after || '(start)'}, ${remaining} items remaining`)
+        }
+        state.done = true
+        saveResume(resumePath, state)
+        break
+      }
+      console.log(
+        `page: ${ids.length} identifiers`,
+        state.after ? `after ${state.after}` : 'from start'
+      )
 
-  return {
-    itemsDone: state.itemsDone,
-    hashesWritten: state.hashesWritten,
-    complete: state.done === true
+      const pending = ids.slice(0, limit - runItems)
+      const results = pMapIterable(pending, async (id) => {
+        try {
+          const rows = await withRetries(id, () => metadataRows(id), {
+            retries: METADATA_RETRIES,
+            delayMs: RETRY_DELAY_MS,
+            isNonRetryable: (e) => /status: (?:40[134]|410|451)\b/.test(e.message)
+          })
+          return { id, rows }
+        } catch (e) {
+          return { id, rows: [], error: e }
+        }
+      }, { concurrency, backpressure: Infinity })
+      for await (const result of results) {
+        if (result.error) {
+          console.error('failed', result.id, result.error.message)
+          appendLine(skipPath, `${result.id}\t${result.error.message.replace(/[\t\r\n]/g, ' ')}`)
+        }
+        commit(result.id, result.rows)
+      }
+
+      if (runItems >= limit) break
+      logProgress(state, runItems, started)
+      if (state.total > 0 && state.itemsDone >= state.total) {
+        state.done = true
+        saveResume(resumePath, state)
+        break
+      }
+    }
+
+    return {
+      itemsDone: state.itemsDone,
+      hashesWritten: state.hashesWritten,
+      complete: state.done === true
+    }
+  } finally {
+    closeSession()
   }
 }
 
@@ -267,7 +357,7 @@ const main = async () => {
     throw new Error(`invalid --page-size: ${args['page-size']}`)
   }
   const concurrency = Number(args.concurrency)
-  if (!Number.isInteger(concurrency) || concurrency < 1) {
+  if (!Number.isInteger(concurrency) || concurrency < 1 || concurrency > CONCURRENCY) {
     throw new Error(`invalid --concurrency: ${args.concurrency}`)
   }
 
