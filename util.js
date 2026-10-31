@@ -206,7 +206,8 @@ const defaultNonRetryable = (e) =>
 export const withRetries = async (label, fn, {
   retries = 5,
   delayMs = 10000,
-  isNonRetryable = defaultNonRetryable
+  isNonRetryable = defaultNonRetryable,
+  shouldLogRetry = () => true
 } = {}) => {
   let lastError
   for (let attempt = 1; attempt <= retries; attempt++) {
@@ -217,8 +218,10 @@ export const withRetries = async (label, fn, {
       if (isNonRetryable(e)) {
         throw e
       }
-      const cause = e.cause ? ` (${e.cause.message || e.cause})` : ''
-      logError(`retry ${attempt}/${retries}`, label, `${e.message}${cause}`)
+      if (shouldLogRetry(e, attempt, retries)) {
+        const cause = e.cause ? ` (${e.cause.message || e.cause})` : ''
+        logError(`retry ${attempt}/${retries}`, label, `${e.message}${cause}`)
+      }
       if (attempt < retries) {
         const waitMs = e.retryAfterMs > 0 ? e.retryAfterMs : delayMs * attempt
         await sleep(waitMs)

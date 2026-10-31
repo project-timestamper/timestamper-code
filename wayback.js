@@ -76,6 +76,7 @@ const createMetaStats = () => ({
   httpOk: 0,
   httpErrors: 0,
   timeouts: 0,
+  loggedTimeouts: 0,
   badMetadata: 0,
   totalMs: 0,
   byStatus: Object.create(null),
@@ -84,6 +85,8 @@ const createMetaStats = () => ({
   latencies: [],
   latencyIdx: 0
 })
+
+const isTimeoutMessage = (message) => /timeout after\b/.test(String(message || ''))
 
 const bump = (map, key) => {
   map[key] = (map[key] || 0) + 1
@@ -135,10 +138,12 @@ const formatMetaStats = (stats) => {
     .slice(0, 5)
     .map(([k, n]) => `${k}:${n}`)
     .join(' ')
+  const timeoutDelta = stats.timeouts - stats.loggedTimeouts
+  stats.loggedTimeouts = stats.timeouts
   return (
     `http err ${httpErrPct}% (${stats.httpErrors}/${stats.attempts}), ` +
     `avg ${avgMs}ms p50 ${p50}ms p95 ${p95}ms, ` +
-    `timeouts ${stats.timeouts}, ` +
+    `timeouts +${timeoutDelta} (${stats.timeouts} total), ` +
     `item fail ${itemFailPct}% (${stats.itemsFailed}/${items || 0}), ` +
     `bad meta ${stats.badMetadata}` +
     (statuses ? `, statuses ${statuses}` : '')
@@ -344,7 +349,9 @@ export const collectWaybackCdxHashes = async ({
           // retrying usually just stalls concurrency slots.
           isNonRetryable: (e) =>
             /bad metadata\b/.test(e.message) ||
-            /status: (?:40[134]|410|451)\b/.test(e.message)
+            /status: (?:40[134]|410|451)\b/.test(e.message),
+          // Timeout storms are tracked in stats; per-attempt logs are too noisy.
+          shouldLogRetry: (e) => !isTimeoutMessage(e.message)
         })
         return { id, rows }
       } catch (e) {
@@ -353,8 +360,10 @@ export const collectWaybackCdxHashes = async ({
     }, { concurrency, backpressure: Infinity })
     for await (const result of results) {
       if (result.error) {
-        logError('failed', result.id, result.error.message)
-        appendLine(skipPath, `${result.id}\t${result.error.message.replace(/[\t\r\n]/g, ' ')}`)
+        if (!isTimeoutMessage(result.error.message)) {
+          logError('failed', result.id, result.error.message)
+        }
+        appendLine(skipPath, `${result.id}\t${result.error.message.replace(/[\t\r\n]+/g, ' ')}`)
       }
       commit(result.id, result.rows, Boolean(result.error))
     }
