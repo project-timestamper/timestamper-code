@@ -58,18 +58,80 @@ const pageQuery = (after) => {
   return `mediatype:web AND identifier:["${id}" TO *] AND NOT identifier:"${id}"`
 }
 
-const fetchJson = async (url) => {
-  const response = await fetch(url, {
-    headers: { 'User-Agent': USER_AGENT, Accept: 'application/json' }
-  })
-  if (response.status === 429 || response.status === 503) {
-    const err = new Error(`status: ${response.status} ${url}`)
-    const retryAfter = Number(response.headers.get('retry-after'))
-    if (Number.isFinite(retryAfter) && retryAfter > 0) err.retryAfterMs = retryAfter * 1000
-    throw err
+const createMetaStats = () => ({
+  attempts: 0,
+  httpOk: 0,
+  httpErrors: 0,
+  badMetadata: 0,
+  totalMs: 0,
+  byStatus: Object.create(null),
+  itemsOk: 0,
+  itemsFailed: 0
+})
+
+const bump = (map, key) => {
+  map[key] = (map[key] || 0) + 1
+}
+
+const recordMetaAttempt = (stats, { ms, status, httpOk, kind }) => {
+  stats.attempts++
+  stats.totalMs += ms
+  if (status) bump(stats.byStatus, String(status))
+  if (httpOk) stats.httpOk++
+  else {
+    stats.httpErrors++
+    if (kind) bump(stats.byStatus, kind)
   }
-  if (!response.ok) throw new Error(`status: ${response.status} ${url}`)
-  return response.json()
+}
+
+const formatMetaStats = (stats) => {
+  const avgMs = stats.attempts > 0 ? Math.round(stats.totalMs / stats.attempts) : 0
+  const httpErrPct = stats.attempts > 0
+    ? ((100 * stats.httpErrors) / stats.attempts).toFixed(1)
+    : '0.0'
+  const items = stats.itemsOk + stats.itemsFailed
+  const itemFailPct = items > 0
+    ? ((100 * stats.itemsFailed) / items).toFixed(1)
+    : '0.0'
+  const statuses = Object.entries(stats.byStatus)
+    .sort((a, b) => b[1] - a[1])
+    .slice(0, 5)
+    .map(([k, n]) => `${k}:${n}`)
+    .join(' ')
+  return (
+    `http err ${httpErrPct}% (${stats.httpErrors}/${stats.attempts}), ` +
+    `avg ${avgMs}ms, ` +
+    `item fail ${itemFailPct}% (${stats.itemsFailed}/${items || 0}), ` +
+    `bad meta ${stats.badMetadata}` +
+    (statuses ? `, statuses ${statuses}` : '')
+  )
+}
+
+const fetchJson = async (url, stats = null) => {
+  const started = Date.now()
+  let status = 0
+  try {
+    const response = await fetch(url, {
+      headers: { 'User-Agent': USER_AGENT, Accept: 'application/json' }
+    })
+    status = response.status
+    if (response.status === 429 || response.status === 503) {
+      const err = new Error(`status: ${response.status} ${url}`)
+      const retryAfter = Number(response.headers.get('retry-after'))
+      if (Number.isFinite(retryAfter) && retryAfter > 0) err.retryAfterMs = retryAfter * 1000
+      throw err
+    }
+    if (!response.ok) throw new Error(`status: ${response.status} ${url}`)
+    const data = await response.json()
+    if (stats) recordMetaAttempt(stats, { ms: Date.now() - started, status, httpOk: true })
+    return data
+  } catch (e) {
+    if (stats) {
+      const kind = status ? null : (e.name === 'TimeoutError' ? 'timeout' : 'network')
+      recordMetaAttempt(stats, { ms: Date.now() - started, status, httpOk: false, kind })
+    }
+    throw e
+  }
 }
 
 const searchPage = async (after, rows) => {
@@ -119,10 +181,13 @@ const cdxRows = (identifier, files) => {
   return rows
 }
 
-const metadataRows = async (identifier) => {
+const metadataRows = async (identifier, stats) => {
   const url = `${METADATA}/${encodeURIComponent(identifier)}/files`
-  const data = await fetchJson(url)
-  if (!data || !Array.isArray(data.result)) throw new Error(`bad metadata ${url}`)
+  const data = await fetchJson(url, stats)
+  if (!data || !Array.isArray(data.result)) {
+    if (stats) stats.badMetadata++
+    throw new Error(`bad metadata ${url}`)
+  }
   return cdxRows(identifier, data.result)
 }
 
@@ -141,7 +206,7 @@ const saveResume = (path, state) => {
   fs.renameSync(tmp, path)
 }
 
-const logProgress = (state, runItems, started) => {
+const logProgress = (state, runItems, started, stats) => {
   const elapsed = Date.now() - started
   const remaining = Math.max(0, state.total - state.itemsDone)
   const eta = runItems > 0 ? remaining * (elapsed / runItems) : 0
@@ -150,6 +215,7 @@ const logProgress = (state, runItems, started) => {
     `${state.hashesWritten} hashes, ` +
     `elapsed ${formatDuration(elapsed)}, eta ${formatDuration(eta)}`
   )
+  if (stats && stats.attempts > 0) console.log(`stats: ${formatMetaStats(stats)}`)
 }
 
 export const collectWaybackCdxHashes = async ({
@@ -178,15 +244,18 @@ export const collectWaybackCdxHashes = async ({
 
   const started = Date.now()
   let runItems = 0
+  const stats = createMetaStats()
 
-  const commit = (id, rows) => {
+  const commit = (id, rows, failed = false) => {
     for (const row of rows) appendHash(outputPath, row.path, row.sha1)
     state.hashesWritten += rows.length
     state.after = id
     state.itemsDone++
     runItems++
+    if (failed) stats.itemsFailed++
+    else stats.itemsOk++
     saveResume(resumePath, state)
-    if (runItems % LOG_EVERY === 0) logProgress(state, runItems, started)
+    if (runItems % LOG_EVERY === 0) logProgress(state, runItems, started, stats)
   }
 
   for (;;) {
@@ -218,7 +287,7 @@ export const collectWaybackCdxHashes = async ({
     const pending = ids.slice(0, limit - runItems)
     const results = pMapIterable(pending, async (id) => {
       try {
-        const rows = await withRetries(id, () => metadataRows(id), {
+        const rows = await withRetries(id, () => metadataRows(id, stats), {
           retries: METADATA_RETRIES,
           delayMs: RETRY_DELAY_MS,
           isNonRetryable: (e) => /status: (?:40[134]|410|451)\b/.test(e.message)
@@ -233,11 +302,11 @@ export const collectWaybackCdxHashes = async ({
         console.error('failed', result.id, result.error.message)
         appendLine(skipPath, `${result.id}\t${result.error.message.replace(/[\t\r\n]/g, ' ')}`)
       }
-      commit(result.id, result.rows)
+      commit(result.id, result.rows, Boolean(result.error))
     }
 
     if (runItems >= limit) break
-    logProgress(state, runItems, started)
+    logProgress(state, runItems, started, stats)
     if (state.total > 0 && state.itemsDone >= state.total) {
       state.done = true
       saveResume(resumePath, state)
@@ -245,10 +314,12 @@ export const collectWaybackCdxHashes = async ({
     }
   }
 
+  if (stats.attempts > 0) console.log(`stats: ${formatMetaStats(stats)}`)
   return {
     itemsDone: state.itemsDone,
     hashesWritten: state.hashesWritten,
-    complete: state.done === true
+    complete: state.done === true,
+    stats
   }
 }
 
