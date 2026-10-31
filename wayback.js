@@ -40,8 +40,14 @@ const CONCURRENCY = 8
 const SEARCH_RETRIES = 8
 const METADATA_RETRIES = 5
 const RETRY_DELAY_MS = 5000
+/** Cap hung metadata/search fetches so they cannot hold a concurrency slot forever. */
+const FETCH_TIMEOUT_MS = 5000
 const LOG_EVERY = 100
 const SHA1_RE = /^[0-9a-f]{40}$/
+
+const isTimeoutError = (e) =>
+  e && (e.name === 'TimeoutError' ||
+    (e.name === 'AbortError' && /timeout/i.test(String(e.message || ''))))
 
 const escapeIdentifier = (id) => id.replace(/\\/g, '\\\\').replace(/"/g, '\\"')
 
@@ -67,6 +73,7 @@ const createMetaStats = () => ({
   attempts: 0,
   httpOk: 0,
   httpErrors: 0,
+  timeouts: 0,
   badMetadata: 0,
   totalMs: 0,
   byStatus: Object.create(null),
@@ -129,18 +136,20 @@ const formatMetaStats = (stats) => {
   return (
     `http err ${httpErrPct}% (${stats.httpErrors}/${stats.attempts}), ` +
     `avg ${avgMs}ms p50 ${p50}ms p95 ${p95}ms, ` +
+    `timeouts ${stats.timeouts}, ` +
     `item fail ${itemFailPct}% (${stats.itemsFailed}/${items || 0}), ` +
     `bad meta ${stats.badMetadata}` +
     (statuses ? `, statuses ${statuses}` : '')
   )
 }
 
-const fetchJson = async (url, stats = null) => {
+const fetchJson = async (url, stats = null, timeoutMs = FETCH_TIMEOUT_MS) => {
   const started = Date.now()
   let status = 0
   try {
     const response = await fetch(url, {
-      headers: { 'User-Agent': USER_AGENT, Accept: 'application/json' }
+      headers: { 'User-Agent': USER_AGENT, Accept: 'application/json' },
+      signal: AbortSignal.timeout(timeoutMs)
     })
     status = response.status
     if (response.status === 429 || response.status === 503) {
@@ -155,8 +164,15 @@ const fetchJson = async (url, stats = null) => {
     return data
   } catch (e) {
     if (stats) {
-      const kind = status ? null : (e.name === 'TimeoutError' ? 'timeout' : 'network')
+      const timedOut = isTimeoutError(e)
+      if (timedOut) stats.timeouts++
+      const kind = status ? null : (timedOut ? 'timeout' : 'network')
       recordMetaAttempt(stats, { ms: Date.now() - started, status, httpOk: false, kind })
+    }
+    if (isTimeoutError(e)) {
+      const err = new Error(`timeout after ${timeoutMs}ms ${url}`)
+      err.cause = e
+      throw err
     }
     throw e
   }
