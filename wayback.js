@@ -40,8 +40,10 @@ const CONCURRENCY = 8
 const SEARCH_RETRIES = 8
 const METADATA_RETRIES = 5
 const RETRY_DELAY_MS = 5000
-/** Cap hung metadata/search fetches so they cannot hold a concurrency slot forever. */
-const FETCH_TIMEOUT_MS = 5000
+/** Cap hung metadata fetches so they cannot hold a concurrency slot forever. */
+const METADATA_TIMEOUT_MS = 5000
+/** Advanced search (1000 rows + range query) is slower; keep a higher ceiling. */
+const SEARCH_TIMEOUT_MS = 60000
 const LOG_EVERY = 100
 const SHA1_RE = /^[0-9a-f]{40}$/
 
@@ -143,7 +145,7 @@ const formatMetaStats = (stats) => {
   )
 }
 
-const fetchJson = async (url, stats = null, timeoutMs = FETCH_TIMEOUT_MS) => {
+const fetchJson = async (url, stats = null, timeoutMs = METADATA_TIMEOUT_MS) => {
   const started = Date.now()
   let status = 0
   try {
@@ -187,11 +189,15 @@ const searchPage = async (after, rows) => {
   params.set('page', '1')
   params.set('output', 'json')
   const url = `${SEARCH}?${params}`
-  const data = await withRetries(`search ${after || '(start)'}`, () => fetchJson(url), {
-    retries: SEARCH_RETRIES,
-    delayMs: RETRY_DELAY_MS,
-    isNonRetryable: (e) => /status: (?:400|401|404)\b/.test(e.message)
-  })
+  const data = await withRetries(
+    `search ${after || '(start)'}`,
+    () => fetchJson(url, null, SEARCH_TIMEOUT_MS),
+    {
+      retries: SEARCH_RETRIES,
+      delayMs: RETRY_DELAY_MS,
+      isNonRetryable: (e) => /status: (?:400|401|404)\b/.test(e.message)
+    }
+  )
   if (data.error) throw new Error(String(data.error))
   const docs = data.response && data.response.docs
   if (!Array.isArray(docs) || typeof data.response.numFound !== 'number') {
