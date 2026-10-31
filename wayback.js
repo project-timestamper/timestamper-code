@@ -6,6 +6,8 @@ import {
   appendHash,
   appendLine,
   formatDuration,
+  log,
+  logError,
   sidecarPath,
   USER_AGENT,
   withRetries
@@ -168,12 +170,12 @@ const cdxRows = (identifier, files) => {
     const lower = name.toLowerCase()
     if (!lower.endsWith('.cdx.gz') || lower.endsWith('.os.cdx.gz')) continue
     if (/[\t\r\n]/.test(name) || /[\t\r\n]/.test(identifier)) {
-      console.error('bad name', identifier, name)
+      logError('bad name', identifier, name)
       continue
     }
     const sha1 = String(file.sha1 || '').trim().toLowerCase()
     if (!SHA1_RE.test(sha1)) {
-      console.error('no sha1', identifier, name)
+      logError('no sha1', identifier, name)
       continue
     }
     rows.push({ path: `${identifier}/${name}`, sha1 })
@@ -210,12 +212,12 @@ const logProgress = (state, runItems, started, stats) => {
   const elapsed = Date.now() - started
   const remaining = Math.max(0, state.total - state.itemsDone)
   const eta = runItems > 0 ? remaining * (elapsed / runItems) : 0
-  console.log(
+  log(
     `progress: ${state.itemsDone}/${state.total || '?'} items, ` +
     `${state.hashesWritten} hashes, ` +
     `elapsed ${formatDuration(elapsed)}, eta ${formatDuration(eta)}`
   )
-  if (stats && stats.attempts > 0) console.log(`stats: ${formatMetaStats(stats)}`)
+  if (stats && stats.attempts > 0) log(`stats: ${formatMetaStats(stats)}`)
 }
 
 export const collectWaybackCdxHashes = async ({
@@ -228,19 +230,19 @@ export const collectWaybackCdxHashes = async ({
   const skipPath = sidecarPath(outputPath, 'skipped.txt')
   const state = loadResume(resumePath)
 
-  console.log('output:', outputPath)
-  console.log('query: mediatype:web')
-  console.log('page size:', pageSize, 'concurrency:', concurrency)
+  log('output:', outputPath)
+  log('query: mediatype:web')
+  log('page size:', pageSize, 'concurrency:', concurrency)
   if (state.done && state.itemsDone >= state.total) {
-    console.log('already complete:', state.itemsDone, 'items,', state.hashesWritten, 'hashes')
+    log('already complete:', state.itemsDone, 'items,', state.hashesWritten, 'hashes')
     return { itemsDone: state.itemsDone, hashesWritten: state.hashesWritten, complete: true }
   }
   if (state.done) {
     state.done = false
     saveResume(resumePath, state)
   }
-  if (state.after) console.log('resume after', state.after)
-  if (state.total) console.log('total items:', state.total)
+  if (state.after) log('resume after', state.after)
+  if (state.total) log('total items:', state.total)
 
   const started = Date.now()
   let runItems = 0
@@ -264,7 +266,7 @@ export const collectWaybackCdxHashes = async ({
     if (!state.after && !state.total) {
       state.total = page.total
       saveResume(resumePath, state)
-      console.log('total items:', state.total)
+      log('total items:', state.total)
     }
     const ids = page.ids.filter((id) => !state.after || identifierFollows(id, state.after))
     if (page.ids.length > 0 && ids.length === 0) {
@@ -279,7 +281,7 @@ export const collectWaybackCdxHashes = async ({
       saveResume(resumePath, state)
       break
     }
-    console.log(
+    log(
       `page: ${ids.length} identifiers`,
       state.after ? `after ${state.after}` : 'from start'
     )
@@ -299,7 +301,7 @@ export const collectWaybackCdxHashes = async ({
     }, { concurrency, backpressure: Infinity })
     for await (const result of results) {
       if (result.error) {
-        console.error('failed', result.id, result.error.message)
+        logError('failed', result.id, result.error.message)
         appendLine(skipPath, `${result.id}\t${result.error.message.replace(/[\t\r\n]/g, ' ')}`)
       }
       commit(result.id, result.rows, Boolean(result.error))
@@ -314,7 +316,7 @@ export const collectWaybackCdxHashes = async ({
     }
   }
 
-  if (stats.attempts > 0) console.log(`stats: ${formatMetaStats(stats)}`)
+  if (stats.attempts > 0) log(`stats: ${formatMetaStats(stats)}`)
   return {
     itemsDone: state.itemsDone,
     hashesWritten: state.hashesWritten,
@@ -349,7 +351,7 @@ const main = async () => {
     pageSize,
     concurrency
   })
-  console.log(
+  log(
     `done: ${result.itemsDone} items, ${result.hashesWritten} hashes, ` +
     `complete ${result.complete}, elapsed ${formatDuration(Date.now() - started)}`
   )
@@ -357,7 +359,7 @@ const main = async () => {
 
 if (esMain(import.meta)) {
   main().catch((err) => {
-    console.error(err)
+    logError(err)
     process.exitCode = 1
   })
 }

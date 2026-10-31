@@ -67,6 +67,11 @@ export const moveToUpperCase = async (dir) => {
 
 export const sleep = (ms) => new Promise((resolve) => setTimeout(resolve, ms))
 
+/** ISO timestamp prefix for log lines. */
+export const logStamp = () => new Date().toISOString()
+export const log = (...args) => console.log(logStamp(), ...args)
+export const logError = (...args) => console.error(logStamp(), ...args)
+
 export const USER_AGENT = 'timestamper/0.0.1 (https://github.com/arthuredelstein/timestamper)'
 
 /** fetch with project User-Agent; throws on non-OK or missing body. */
@@ -213,7 +218,7 @@ export const withRetries = async (label, fn, {
         throw e
       }
       const cause = e.cause ? ` (${e.cause.message || e.cause})` : ''
-      console.error(`retry ${attempt}/${retries}`, label, `${e.message}${cause}`)
+      logError(`retry ${attempt}/${retries}`, label, `${e.message}${cause}`)
       if (attempt < retries) {
         const waitMs = e.retryAfterMs > 0 ? e.retryAfterMs : delayMs * attempt
         await sleep(waitMs)
